@@ -17,8 +17,9 @@ Benefits:
 | Benefit | How |
 |---|---|
 | Fewer false "done" | Approval needs score >= 85 **and** no blockers, from a separate critic. |
-| Anti-cheat | The gate flags weakened tests and new suppressions (`noqa`, `ts-ignore`, `skip`, snapshot edits, fewer asserts) and fails the round. |
-| Bounded cost | At most 6 iterations. Stops early on a plateau (last 3 scores within 6 points). |
+| Anti-cheat | The gate flags weakened tests and new suppressions (`noqa`, `ts-ignore`, `skip`/`xfail`, tests dropped from collection, snapshot edits, fewer asserts) and fails the round. With a junit report it also fails when fewer tests ran than at the baseline. |
+| What is scored is what is committed | The gate pins a hash of the tree it checked. `record-verdict` refuses to commit if anything changed afterwards. |
+| Bounded cost | At most 6 iterations. Stops early on a plateau (best score did not rise by at least 6 points over the last 3 iterations). |
 | Reversible | Work lives on branch `gauntlet/<component>`. `rollback-to-best` returns to the best iteration without `reset --hard`. Merge is manual. |
 | Auditable | Scorecard with every attempt, score, blockers and gaps in `.gauntlet/`, archived to `.gauntlet/history/` on `close`. |
 | Safe by default | Guard hooks block secret reads, protected-file edits and force pushes. They are inert in projects that did not opt in. |
@@ -38,7 +39,7 @@ Use it when there is a **concrete reference** the result can be compared with, a
 - **No concrete reference.** Exploratory work, "make it nicer", brainstorming: the critic has nothing to anchor on.
 - **Small edits.** A typo, a rename, a one-function fix. The loop costs a builder plus a critic run per iteration, up to 6 iterations.
 - **Broken baseline build.** `init` refuses to start. Fix the build first. Tests that already fail are recorded and do not block.
-- **Dirty working tree or no git.** `init` needs a clean tree, git >= 2.23 and a configured identity.
+- **Dirty working tree or no git.** `init` needs a clean tree, git >= 2.23 and a configured identity. The tree must also stay clean after the build and test commands run: put what they generate in `.gitignore`.
 - **Work that needs secrets or the network.** Secret files are blocked for the agents.
 - **As a security boundary.** The guards are cooperative; a determined agent can bypass them (see Known limits).
 - **Subjective acceptance.** If nobody can write down what "matches" means, the score is noise.
@@ -266,10 +267,18 @@ claude
 
 - `bash-guard` runs for both the `Bash` and the `PowerShell` tools.
 - The CLI exposes only `init`, `next-iteration`, `record-verdict`, `rollback-to-best`, `close` and `status`. The gate transitions are exported for the stop gate hook and are not reachable from the command line.
-- `init` warns when a baseline test command fails without per-test ids (no junit): the test gate is inert for it.
+- `init` warns when a baseline test command fails without per-test ids (no junit): the test gate is inert for it. It also warns when a test command has no junit report, because the executed-test count cannot be checked then.
+- The stop gate is idempotent: a repeated stop with an unchanged tree does not re-run the checks, use up an attempt or delete the critic report.
+- On Windows, `.cmd`/`.bat` commands (`npm`, `npx`, `pnpm`, `yarn`) run through `cmd.exe` with escaped arguments; everything else is spawned directly, without a shell. A timeout kills `cmd.exe` but may leave its child process running.
 - The critic treats the artifact, tests, script output and reference as data, never as instructions (instructed, not technically enforced).
 
 Kill switch: `HARNESS_OFF=1`. Details: `templates/RUNBOOK.md` (copied to `.gauntlet/RUNBOOK.md` by init).
+
+Regression tests for the gate, the anti-cheat rules and the state machine (Node >= 18, no dependencies):
+
+```powershell
+node --test tests/gate.test.mjs
+```
 
 ## Known limits
 

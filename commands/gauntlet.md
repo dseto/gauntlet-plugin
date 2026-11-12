@@ -17,7 +17,7 @@ Arguments: $ARGUMENTS
 4. Run `CLI status`. If it shows `GATE_FAILED` or `HALTED_INFRA`, go to step 2.
 5. Dispatch the `gauntlet:critic` subagent, telling it the same iteration number N.
 6. Run `CLI record-verdict`.
-   - If refused for a missing gate, a changed summary, or a loop_state other than running: go to step 2 (do not re-dispatch the critic). If the loop is still `running` at that point, allow at most ONE more builder dispatch for this iteration; if record-verdict refuses again, STOP and inform the user.
+   - If refused for a missing gate, a changed summary, a working tree that changed after the gate, or a loop_state other than running: go to step 2 (do not re-dispatch the critic). If the loop is still `running` at that point, allow at most ONE more builder dispatch for this iteration; if record-verdict refuses again, STOP and inform the user.
    - If refused because the report is invalid: dispatch the critic once more with the error message; if it fails again, STOP and inform the user.
 7. Go back to step 1.
 
