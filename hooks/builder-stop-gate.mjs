@@ -2,8 +2,9 @@
 /**
  * SubagentStop hook (matcher: builder) - quality gate for the Gauntlet builder.
  *
- * Checks, in order: reference lock, anti-cheat diff, build, tests (only failures outside the baseline
- * count), builder_summary.json. exit 2 keeps the builder working, bounded by gate_max_attempts.
+ * Checks, in order: reference lock, anti-cheat diff, build, tests (failures outside the baseline, and
+ * fewer executed tests than the baseline), builder_summary.json. On success the checked working tree is
+ * pinned by hash for record-verdict. exit 2 keeps the builder working, bounded by gate_max_attempts.
  * Infra problems (timeouts, missing executables) mark HALTED_INFRA instead of blaming the builder.
  * Unlike the guards, a crash here exits 0 (fail-closed would trap the builder in a loop); safety
  * comes from record-verdict refusing any iteration whose gate did not pass.
@@ -13,7 +14,7 @@ import { isOff, isEnabled, isBuilderAgent, readInput, truncate, debugLog } from 
 import { antiCheat } from './anti-cheat-diff.mjs';
 import {
   ROOT, P, loadScorecard, loadConfig, readJson, verifyRefLock, runChecks, validateSummary,
-  cmdGateAttempt, cmdBuilderPassed, cmdMark,
+  cmdGateAttempt, cmdBuilderPassed, cmdMark, gateStillValid, testCountDrops,
 } from '../scripts/gauntlet-cli.mjs';
 
 /**
@@ -48,6 +49,12 @@ function runGate(input) {
   if (input.agent_type !== undefined && !isBuilderAgent(input.agent_type)) return;
   const sc = loadScorecard();
   if (!sc || sc.loop_state !== 'running') return;
+  // Idempotent: a repeated stop (or a stop of another subagent that reached this hook) must not burn an
+  // attempt, re-run the checks or wipe the critic report when nothing changed since the gate passed.
+  if (gateStillValid(sc)) {
+    process.stdout.write('[HARNESS] gate already passed for this tree; nothing to do\n');
+    return;
+  }
 
   let attempt = 0;
   try {
@@ -78,6 +85,11 @@ function runGate(input) {
   const baseline = new Set(Array.isArray(sc.baseline_failures) ? sc.baseline_failures : []);
   const fresh = tests.failed.filter((id) => !baseline.has(id));
   if (fresh.length) failGate(k, 'tests', `new failures:\n${fresh.join('\n')}\n${tests.log}`);
+  const drops = testCountDrops(sc.baseline_counts, tests.counts);
+  if (drops.length) {
+    failGate(k, 'tests', 'fewer tests executed than at the baseline (tests removed from collection, skipped, xfail or deselected). '
+      + `Restore them; do not hide them:\n${drops.join('\n')}`);
+  }
 
   const n = sc.iteration + 1;
   if (!fs.existsSync(P.summary)) failGate(k, 'builder_summary', `write .gauntlet/inbox/builder_summary.json with iteration ${n}`);

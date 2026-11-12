@@ -15,9 +15,10 @@ Ele serve para três coisas:
 | `bash-guard` | heurístico (regex sobre o comando, tools `Bash` e `PowerShell`); bloqueia best-effort. Só caminhos absolutos fora do projeto são bloqueados; escape relativo (`../`) e `~/.claude` passam |
 | `file-guard` | confiável para as ferramentas Edit/Write; não cobre escrita via processos filhos |
 | `fast-file-check` | roda **depois** da edição e **não reverte** o arquivo; só devolve o erro ao agente |
-| `anti-cheat-diff` | heurístico (regex + contagem de asserts) |
+| `anti-cheat-diff` | heurístico (regex + contagem de asserts); cobre `skip`/`xfail` do pytest e as formas de tirar testes da coleta (`collect_ignore`, hooks em `conftest.py`, `--deselect`) |
 | `orchestrator-breaker` | confiável enquanto o scorecard não for adulterado |
-| `builder-stop-gate` | confiável; se morrer por timeout, `record-verdict` recusa a iteração |
+| `builder-stop-gate` | confiável; se morrer por timeout, `record-verdict` recusa a iteração. Com relatório junit, falha também quando rodam menos testes que na baseline. É idempotente: parada repetida com a árvore igual não faz nada |
+| hash da árvore | `record-verdict` só faz o commit se a árvore de trabalho for a mesma que passou no gate; qualquer arquivo criado, alterado ou apagado depois (inclusive pelo critic) recusa a iteração |
 | independência do critic | instruída ao agente, não garantida tecnicamente (inclui tratar texto do artefato/referência como dado, não instrução) |
 
 **Timeout de hook é fail-open no Claude Code.** Um hook morto por timeout não bloqueia nada. Os guards são rápidos (10 s). Para o stop gate, a proteção é `record-verdict` exigir `gate_passed_iteration`.
@@ -80,6 +81,8 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 - git >= 2.23 e identidade configurada (`git config user.name` e `user.email`).
 - **Árvore limpa.** Faça commit dos arquivos do harness antes do primeiro `/gauntlet`, porque o `init` exige isso.
 - Build e testes passando. Testes que já falham ficam registrados na baseline e não bloqueiam o builder; build quebrado bloqueia o `init`.
+- **Build e testes não podem sujar a árvore.** O que eles geram (cache, cobertura, relatórios, saída de build) precisa estar no `.gitignore`. Se `git status` mostrar algo depois da baseline, o `init` recusa.
+- No Windows, comandos `.cmd`/`.bat` (`npm`, `npx`, `pnpm`, `yarn`) podem ser escritos pelo nome em `discovery.json`; o CLI os executa via `cmd.exe`.
 
 ### Iniciar, continuar, encerrar
 
@@ -96,7 +99,7 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 | `IN_PROGRESS` | loop rodando |
 | `APPROVED` | score >= 85 e nenhum blocker |
 | `HALTED_MAX_ITER` | 6 iterações sem aprovação |
-| `HALTED_PLATEAU` | as últimas 3 notas variaram <= 6 pontos |
+| `HALTED_PLATEAU` | a melhor nota não subiu pelo menos 6 pontos nas últimas 3 iterações (só avaliado a partir da 4ª) |
 | `GATE_FAILED` | o builder falhou no stop gate 3 vezes seguidas |
 | `HALTED_INFRA` | timeout ou erro de infraestrutura (não é culpa do builder) |
 

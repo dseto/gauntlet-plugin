@@ -13,15 +13,52 @@ import { fileURLToPath } from 'node:url';
 /** @typedef {{ st: string, old: string | null, p: string }} Change one changed path (st: git status letter, '?' untracked) */
 /** @typedef {{ path: string, rule: string, reason?: string }} AllowEntry */
 
-/** @type {Array<[string, RegExp]>} rule name (allowlist key) and its detector */
-const RULES = [
+/**
+ * Joins alternatives into one detector so each pattern stays readable on its own line.
+ * @param {RegExp[]} parts patterns without flags
+ * @returns {RegExp} a regex matching any of them
+ */
+function anyOf(parts) {
+  return new RegExp(parts.map((r) => r.source).join('|'));
+}
+
+/** Skipped tests in JS/TS runners, xUnit (C#) and unittest. */
+const SKIP_GENERIC_RE = anyOf([
+  /\b(test|it|describe)\.skip\s*\(/,
+  /\bxit\s*\(/,
+  /\bxdescribe\s*\(/,
+  /\[Fact\(Skip\s*=/,
+  /@unittest\.(skip|expectedFailure)/,
+]);
+
+/** pytest: tests that are skipped, expected to fail, or never collected. */
+const SKIP_PYTEST_RE = anyOf([
+  /\bpytest\.mark\.(skip|skipif|xfail)\b/, // decorator or module-level `pytestmark = pytest.mark.skip`
+  /\bpytest\.(skip|xfail)\s*\(/, // imperative skip/xfail inside a test
+  /\bcollect_ignore(_glob)?\b/, // conftest.py collection blacklist
+  /\bpytest_(collection_modifyitems|ignore_collect|deselected)\b/, // conftest.py hooks that drop items
+  /--deselect\b/, // pytest-only option, flagged wherever it is added
+  /\b(addopts|pytest)\b.*(\s--ignore(-glob)?[= ]|\s-k[= ])/, // generic options, only next to pytest/addopts
+]);
+
+/** @type {ReadonlyArray<[string, RegExp]>} rule name (allowlist key) and its detector */
+const RULES = Object.freeze([
   ['ts-ignore', /@ts-ignore\b/],
   ['ts-expect-error', /@ts-expect-error\b/],
   ['eslint-disable', /eslint-disable/],
   ['type-ignore', /#\s*type:\s*ignore\b/],
   ['noqa', /#\s*noqa\b/],
-  ['skip', /\b(test|it|describe)\.skip\s*\(|\bxit\s*\(|\bxdescribe\s*\(|\[Fact\(Skip\s*=|@pytest\.mark\.skip(if)?\b|\bpytest\.skip\s*\(|@unittest\.skip/],
-];
+  ['skip', anyOf([SKIP_GENERIC_RE, SKIP_PYTEST_RE])],
+]);
+
+/** Directories that hold tests in any language. */
+const TEST_DIR_RE = /(^|\/)(tests?|__tests__)\//;
+/** Test file basenames per ecosystem. conftest.py counts: it decides what pytest collects. */
+const TEST_BASENAME_RES = Object.freeze([
+  /^test_.*\.py$/, /_test\.(py|go)$/, /^conftest\.py$/, // Python, Go
+  /\.(test|spec)\.[jt]sx?$/, // JS/TS
+  /Tests?\.(java|kt|cs)$/, // JVM, C#
+]);
 const ASSERT_RE = /\bexpect\s*\(|\bassert\b|\bAssert\.|\bself\.assert\w*\s*\(|\bpytest\.raises\s*\(/g;
 const COMMENTED_TEST_RE = /^\s*(#|\/\/)\s*(def test_|async def test_|it\s*\(|test\s*\(|describe\s*\(|assert\b|expect\s*\()/;
 
@@ -41,11 +78,13 @@ function git(cwd, args) {
 
 /**
  * @param {string} p repo-relative path with forward slashes
- * @returns {boolean} true for test files (tests/ dirs, test_*.py, *_test.py, *.test|spec.[jt]s)
+ * @returns {boolean} true for test files (tests/ dirs, test_*.py, *_test.py, conftest.py, *.test|spec.[jt]s,
+ *   *_test.go, *Test(s).java|kt|cs)
  */
 export function isTestFile(p) {
-  const b = p.split('/').pop() || '';
-  return /(^|\/)(tests?|__tests__)\//.test(p) || /^test_.*\.py$/.test(b) || /_test\.py$/.test(b) || /\.(test|spec)\.[jt]sx?$/.test(b);
+  if (typeof p !== 'string' || !p) return false;
+  const base = p.split('/').pop() || '';
+  return TEST_DIR_RE.test(p) || TEST_BASENAME_RES.some((re) => re.test(base));
 }
 
 /** @param {string} p @returns {boolean} true for paths owned by the harness itself */

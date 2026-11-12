@@ -34,8 +34,11 @@
  * @property {number} gate_max_attempts
  * @property {number} gate_attempts_current
  * @property {string[]} baseline_failures
+ * @property {Record<string, TestCounts>} [baseline_counts] per test command, from the junit report at init
+ * @property {number} [plateau_window] iterations the best score may stay flat (default 3)
  * @property {number | null} gate_passed_iteration
  * @property {string | null} builder_summary_sha256
+ * @property {string | null} [gate_tree] git tree hash of the working tree that passed the gate
  * @property {{ iteration: number | null, score: number, sha: string | null }} best
  * @property {number[]} score_history
  * @property {Attempt[]} attempts
@@ -50,7 +53,8 @@
  * @property {number} [seconds] duration measured at discovery (timeout = max(60, 2x))
  * @property {'pytest'} [junit] reporter used to extract failing test ids
  */
-/** @typedef {{ status: 'ok'|'fail'|'infra', failed: string[], log: string, warnings?: string[] }} CheckResult */
+/** @typedef {{ tests: number, skipped: number }} TestCounts collected test cases and how many were skipped (xfail included) */
+/** @typedef {{ status: 'ok'|'fail'|'infra', failed: string[], log: string, warnings?: string[], counts?: Record<string, TestCounts> }} CheckResult */
 /** @typedef {{ schema_version: number, criteria: Record<string, { max: number, desc?: string }> }} Rubric */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -135,12 +139,12 @@ export function loadConfig() { return readJson(P.config); }
 /**
  * Runs git in the project root without a shell.
  * @param {string[]} args
- * @param {{ allowFail?: boolean }} [opts] allowFail returns the exit code instead of throwing
+ * @param {{ allowFail?: boolean, env?: NodeJS.ProcessEnv }} [opts] allowFail returns the exit code instead of throwing
  * @returns {{ code: number | null, out: string }}
  * @throws {CliError} on non-zero exit unless allowFail
  */
-export function git(args, { allowFail = false } = {}) {
-  const r = spawnSync('git', ['-c', 'core.quotepath=false', ...args], { cwd: ROOT, encoding: 'utf8', shell: false, maxBuffer: 64 * 1024 * 1024 });
+export function git(args, { allowFail = false, env = process.env } = {}) {
+  const r = spawnSync('git', ['-c', 'core.quotepath=false', ...args], { cwd: ROOT, encoding: 'utf8', shell: false, env, maxBuffer: 64 * 1024 * 1024 });
   if (r.error) throw r.error;
   if (r.status !== 0 && !allowFail) fail(`git ${args.join(' ')} failed: ${(r.stderr || r.stdout || '').trim()}`);
   return { code: r.status, out: (r.stdout || '').trim() };
@@ -161,31 +165,147 @@ function requireGit() {
 /** @returns {boolean} true when `git status --porcelain` is empty (ignored files excluded) */
 function treeClean() { return git(['status', '--porcelain']).out === ''; }
 
+// What an iteration commit contains: everything except the harness files. The gate hash also leaves out
+// the loop state the CLI and the agents write between the gate and the verdict.
+const COMMIT_SPEC = ['.', ':(exclude).claude'];
+const LOOP_STATE = ['.gauntlet/inbox', '.gauntlet/history', '.gauntlet/scorecard.json'];
+
+/**
+ * Hashes the working tree as git would commit it (tracked + untracked, ignored files excluded) using a
+ * temporary index, so the real index is never touched.
+ * @returns {string} git tree object id
+ * @throws {CliError} on git failure
+ */
+export function worktreeTreeHash() {
+  const idx = path.join(os.tmpdir(), `gauntlet-index-${process.pid}-${Date.now()}`);
+  const env = { ...process.env, GIT_INDEX_FILE: idx };
+  try {
+    git(['read-tree', 'HEAD'], { env });
+    git(['add', '-A', '--', ...COMMIT_SPEC], { env });
+    // Dropped from the index afterwards: naming an ignored path in a pathspec makes `git add` fail.
+    git(['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', ...LOOP_STATE], { env });
+    return git(['write-tree'], { env }).out;
+  } finally {
+    fs.rmSync(idx, { force: true });
+    fs.rmSync(`${idx}.lock`, { force: true });
+  }
+}
+
+/**
+ * True when the gate already passed for the pending iteration and neither the working tree nor the
+ * builder summary changed since. A repeated stop hook is then a no-op.
+ * @param {Scorecard} sc
+ * @returns {boolean}
+ */
+export function gateStillValid(sc) {
+  return sc.gate_passed_iteration === sc.iteration + 1 && !!sc.gate_tree
+    && fs.existsSync(P.summary) && sha256File(P.summary) === sc.builder_summary_sha256
+    && worktreeTreeHash() === sc.gate_tree;
+}
+
 // ---------- checks (build/test), shared with the stop gate ----------
 
 /** @param {CheckCommand} c @returns {number} child timeout in ms: max(60s, 2x measured) */
 function childTimeout(c) { return Math.max(60, Math.round((c.seconds || 0) * 2)) * 1000; }
 
 /**
- * Extracts failing test ids (`classname::name`) from a JUnit XML report.
+ * Reads a JUnit XML report: failing test ids (`classname::name`), collected test cases and skipped ones
+ * (pytest reports xfail as skipped).
  * @param {string} xml
- * @returns {string[]}
+ * @returns {{ failed: string[] } & TestCounts}
  */
-function parseJunit(xml) {
+export function parseJunit(xml) {
   /** @type {string[]} */
   const failed = [];
+  let tests = 0;
+  let skipped = 0;
   const re = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
   let m;
   while ((m = re.exec(xml))) {
     const attrs = m[1];
     const body = m[3] || '';
+    tests += 1;
+    if (/<skipped\b/.test(body)) skipped += 1;
     if (/<(failure|error)\b/.test(body)) {
       /** @param {string} n @returns {string} */
       const attr = (n) => ((new RegExp(`\\b${n}="([^"]*)"`).exec(attrs) || [])[1] || '');
       failed.push(`${attr('classname')}::${attr('name')}`);
     }
   }
-  return failed;
+  return { failed, tests, skipped };
+}
+
+/**
+ * Lists test commands that executed fewer tests than the baseline. Removing tests from collection,
+ * skipping or xfail-ing them does not create a new failure, so the failure diff alone misses it.
+ * @param {Record<string, TestCounts> | undefined} base counts recorded at init
+ * @param {Record<string, TestCounts> | undefined} now counts of the current run
+ * @returns {string[]} human-readable drops; empty means none
+ */
+export function testCountDrops(base, now) {
+  /** @type {string[]} */
+  const out = [];
+  for (const [name, b] of Object.entries(base || {})) {
+    const n = now && now[name];
+    const before = b.tests - b.skipped;
+    if (!n) { out.push(`${name}: no test report (baseline executed ${before})`); continue; }
+    const after = n.tests - n.skipped;
+    if (after < before) out.push(`${name}: executed ${before} -> ${after} (collected ${b.tests} -> ${n.tests}, skipped ${b.skipped} -> ${n.skipped})`);
+  }
+  return out;
+}
+
+// cmd.exe metacharacters, escaped with ^ when a .cmd/.bat has to run through cmd.exe.
+const CMD_META_RE = /([()\][%!^"`<>&|;, *?])/g;
+
+/**
+ * @param {string} arg one argument
+ * @param {boolean} twice escape twice (npm .bin shims re-parse their arguments)
+ * @returns {string} argument quoted for a cmd.exe command line
+ */
+function cmdArg(arg, twice) {
+  let a = String(arg).replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1');
+  a = `"${a}"`.replace(CMD_META_RE, '^$1');
+  return twice ? a.replace(CMD_META_RE, '^$1') : a;
+}
+
+/**
+ * Windows only: finds the file a bare command name resolves to (PATH + .com/.exe/.bat/.cmd).
+ * @param {string} cmd0 executable as written in the config
+ * @param {string} cwd working directory of the command
+ * @returns {string | null} full path, or null when nothing matches
+ */
+function resolveWinExe(cmd0, cwd) {
+  const hasDir = /[\\/]/.test(cmd0);
+  const dirs = hasDir ? [path.dirname(path.resolve(cwd, cmd0))] : [cwd, ...String(process.env.PATH || process.env.Path || '').split(';').filter(Boolean)];
+  const exts = path.extname(cmd0) ? [''] : ['.com', '.exe', '.bat', '.cmd'];
+  for (const d of dirs) {
+    for (const e of exts) {
+      const f = path.join(d, path.basename(cmd0) + e);
+      try { if (fs.statSync(f).isFile()) return f; } catch { /* not here */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Builds the spawn call for a check command. Node cannot spawn .cmd/.bat without a shell on Windows
+ * (ENOENT for `npm`, EINVAL for `npm.cmd`), so those run through cmd.exe with every argument escaped.
+ * Anything else is spawned directly, as written.
+ * @param {string[]} cmd executable + arguments
+ * @param {string} cwd working directory
+ * @param {NodeJS.Platform} [platform]
+ * @returns {{ exe: string, args: string[], verbatim: boolean }}
+ */
+export function spawnPlan(cmd, cwd, platform = process.platform) {
+  const exe = /[\\/]/.test(cmd[0]) ? path.resolve(cwd, cmd[0]) : cmd[0];
+  const args = cmd.slice(1);
+  if (platform !== 'win32') return { exe, args, verbatim: false };
+  const found = resolveWinExe(cmd[0], cwd);
+  if (!found || !/\.(cmd|bat)$/i.test(found)) return { exe, args, verbatim: false };
+  const twice = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/i.test(found);
+  const line = [path.normalize(found).replace(CMD_META_RE, '^$1'), ...args.map((a) => cmdArg(a, twice))].join(' ');
+  return { exe: process.env.ComSpec || process.env.comspec || 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], verbatim: true };
 }
 
 /**
@@ -196,29 +316,33 @@ function parseJunit(xml) {
  */
 export function runCommand(c) {
   if (!c || !Array.isArray(c.cmd) || c.cmd.length === 0) return { status: 'infra', failed: [], log: 'invalid command config' };
-  const args = [...c.cmd.slice(1)];
+  const cmd = [...c.cmd];
   /** @type {string | null} */
   let junitFile = null;
   if (c.junit === 'pytest') {
     junitFile = path.join(os.tmpdir(), `gauntlet-junit-${process.pid}-${Date.now()}.xml`);
-    args.push(`--junitxml=${junitFile}`);
+    cmd.push(`--junitxml=${junitFile}`);
   }
   const cwd = path.join(ROOT, c.cwd || '.');
-  const exe = /[\\/]/.test(c.cmd[0]) ? path.resolve(cwd, c.cmd[0]) : c.cmd[0];
-  const r = spawnSync(exe, args, { cwd, encoding: 'utf8', shell: false, timeout: childTimeout(c), maxBuffer: 64 * 1024 * 1024 });
+  const plan = spawnPlan(cmd, cwd);
+  const r = spawnSync(plan.exe, plan.args, {
+    cwd, encoding: 'utf8', shell: false, windowsVerbatimArguments: plan.verbatim, timeout: childTimeout(c), maxBuffer: 64 * 1024 * 1024,
+  });
   const log = `${r.stdout || ''}${r.stderr || ''}`;
+  /** @type {ReturnType<typeof parseJunit> | null} */
+  let junit = null;
+  if (junitFile && fs.existsSync(junitFile)) {
+    junit = parseJunit(fs.readFileSync(junitFile, 'utf8'));
+    fs.rmSync(junitFile, { force: true });
+  }
   if (r.error) {
     const code = /** @type {NodeJS.ErrnoException} */ (r.error).code;
     return { status: 'infra', failed: [], log: `${c.name}: ${code || r.error.message}\n${log}` };
   }
-  if (r.status === 0) { if (junitFile) fs.rmSync(junitFile, { force: true }); return { status: 'ok', failed: [], log }; }
-  let failed = [`${c.name}::<command>`];
-  if (junitFile && fs.existsSync(junitFile)) {
-    const ids = parseJunit(fs.readFileSync(junitFile, 'utf8'));
-    if (ids.length) failed = ids.map((id) => `${c.name}::${id}`);
-    fs.rmSync(junitFile, { force: true });
-  }
-  return { status: 'fail', failed, log };
+  const counts = junit ? { [c.name]: { tests: junit.tests, skipped: junit.skipped } } : undefined;
+  if (r.status === 0) return { status: 'ok', failed: [], log, counts };
+  const failed = junit && junit.failed.length ? junit.failed.map((id) => `${c.name}::${id}`) : [`${c.name}::<command>`];
+  return { status: 'fail', failed, log, counts };
 }
 
 /**
@@ -235,16 +359,17 @@ function cmdList(cfg, kind) {
  * Runs all commands of a kind. Stops at the first infra failure.
  * @param {any} cfg discovery config
  * @param {'build'|'test'} kind
- * @returns {CheckResult & { warnings: string[] }}
+ * @returns {CheckResult & { warnings: string[], counts: Record<string, TestCounts> }}
  */
 export function runChecks(cfg, kind) {
   const list = cmdList(cfg, kind);
-  if (!list.length) return { status: 'ok', failed: [], log: '', warnings: [`${kind} command is NONE; skipped`] };
-  /** @type {CheckResult & { warnings: string[] }} */
-  const out = { status: 'ok', failed: [], log: '', warnings: [] };
+  if (!list.length) return { status: 'ok', failed: [], log: '', warnings: [`${kind} command is NONE; skipped`], counts: {} };
+  /** @type {CheckResult & { warnings: string[], counts: Record<string, TestCounts> }} */
+  const out = { status: 'ok', failed: [], log: '', warnings: [], counts: {} };
   for (const c of list) {
     const r = runCommand(c);
     out.log += `--- ${c.name} (${r.status})\n${r.log}\n`;
+    Object.assign(out.counts, r.counts || {});
     if (r.status === 'infra') return { ...out, status: 'infra' };
     if (r.status === 'fail') { out.status = 'fail'; out.failed.push(...r.failed); }
   }
@@ -406,6 +531,16 @@ export function cmdInit(component, referencePath, rubricArg) {
       warnings.push(`baseline test command "${id.slice(0, -'::<command>'.length)}" fails without per-test ids (no junit): the test gate is inert for it and new failures will NOT block`);
     }
   }
+  for (const c of cmdList(cfg, 'test')) {
+    if (!tests.counts[c.name]) warnings.push(`test command "${c.name}" has no junit report: the number of executed tests is not checked`);
+  }
+  // The gate pins the tree that passed; commands that rewrite or leave untracked files would make every
+  // verdict look like a change after the gate (and would ride along in the iteration commits).
+  const dirty = git(['status', '--porcelain']).out.split('\n').filter(Boolean);
+  if (dirty.length) {
+    fail('[GAUNTLET] FAIL build/test commands change the working tree; add generated files to .gitignore, commit, and run init again:\n'
+      + dirty.slice(0, 10).join('\n') + (dirty.length > 10 ? `\n... and ${dirty.length - 10} more` : ''));
+  }
 
   const origBranch = git(['rev-parse', '--abbrev-ref', 'HEAD']).out;
   const baseSha = git(['rev-parse', 'HEAD']).out;
@@ -426,10 +561,10 @@ export function cmdInit(component, referencePath, rubricArg) {
     save({
       schema_version: 1, loop_state: 'running', status: 'IN_PROGRESS', component,
       reference_path: '.gauntlet/reference/', branch, base_sha: initSha, parent_sha: baseSha, original_branch: origBranch,
-      iteration: 0, max_iterations: 6, pass_threshold: 85, plateau_epsilon: 6,
+      iteration: 0, max_iterations: 6, pass_threshold: 85, plateau_epsilon: 6, plateau_window: 3,
       gate_max_attempts: 3, gate_attempts_current: 0,
-      baseline_failures: tests.failed, warnings,
-      gate_passed_iteration: null, builder_summary_sha256: null,
+      baseline_failures: tests.failed, baseline_counts: tests.counts, warnings,
+      gate_passed_iteration: null, builder_summary_sha256: null, gate_tree: null,
       best: { iteration: null, score: -1, sha: null }, score_history: [], attempts: [],
       created_at: new Date().toISOString(),
     });
@@ -459,7 +594,8 @@ export function cmdGateAttempt() {
 }
 
 /**
- * Records that the builder passed the gate: wipes any (forged) critic report, pins the summary hash.
+ * Records that the builder passed the gate: wipes any (forged) critic report, pins the summary hash and
+ * the hash of the working tree that was checked.
  * @returns {string} message
  */
 export function cmdBuilderPassed() {
@@ -468,6 +604,7 @@ export function cmdBuilderPassed() {
   if (!fs.existsSync(P.summary)) fail('[GAUNTLET] FAIL builder_summary.json missing');
   sc.gate_passed_iteration = sc.iteration + 1;
   sc.builder_summary_sha256 = sha256File(P.summary);
+  sc.gate_tree = worktreeTreeHash();
   sc.gate_attempts_current = 0;
   save(sc);
   return `[GAUNTLET] gate passed for iteration ${sc.gate_passed_iteration}`;
@@ -487,9 +624,23 @@ export function cmdMark(status, reason) {
 }
 
 /**
- * Scores an iteration: requires running loop + passed gate + unchanged summary + intact reference +
- * valid report; commits, updates history/best, archives the inbox and evaluates stop conditions
- * (APPROVED, then HALTED_MAX_ITER, then HALTED_PLATEAU). Refusals never change state.
+ * True when the best score did not rise by at least `epsilon` over the last `window` iterations.
+ * Compares the best of the last `window` scores with the best before them, so a loop that keeps
+ * improving (78, 81, 84) is not stopped just because its recent scores are close together.
+ * @param {number[]} history scores in iteration order
+ * @param {number} epsilon minimum gain that counts as progress
+ * @param {number} [window] iterations to look back
+ * @returns {boolean}
+ */
+export function isPlateau(history, epsilon, window = 3) {
+  if (history.length <= window) return false;
+  return Math.max(...history.slice(-window)) - Math.max(...history.slice(0, -window)) < epsilon;
+}
+
+/**
+ * Scores an iteration: requires running loop + passed gate + unchanged summary + unchanged working tree +
+ * intact reference + valid report; commits, updates history/best, archives the inbox and evaluates stop
+ * conditions (APPROVED, then HALTED_MAX_ITER, then HALTED_PLATEAU). Refusals never change state.
  * @returns {string} message
  */
 export function cmdRecordVerdict() {
@@ -498,6 +649,16 @@ export function cmdRecordVerdict() {
   const n = sc.iteration + 1;
   if (sc.gate_passed_iteration !== n) fail('[GAUNTLET] FAIL builder gate did not pass for this iteration');
   if (!fs.existsSync(P.summary) || sha256File(P.summary) !== sc.builder_summary_sha256) fail('[GAUNTLET] FAIL builder_summary changed after the gate');
+  // The commit below must contain exactly what the gate checked (loops started before this check have no gate_tree).
+  if (sc.gate_tree) {
+    const now = worktreeTreeHash();
+    if (now !== sc.gate_tree) {
+      const changed = git(['diff', '--name-only', sc.gate_tree, now], { allowFail: true }).out.split('\n').filter(Boolean);
+      fail('[GAUNTLET] FAIL working tree changed after the gate: ' + (changed.slice(0, 10).join(', ') || 'unknown paths')
+        + (changed.length > 10 ? ` and ${changed.length - 10} more` : '')
+        + '. The gate must check the code that gets committed: dispatch the builder again. Files generated by test runs belong in .gitignore.');
+    }
+  }
   verifyRefLock();
   if (!fs.existsSync(P.report)) fail('[GAUNTLET] FAIL critic_report.json missing (invalid report)');
   /** @type {any} */
@@ -515,7 +676,7 @@ export function cmdRecordVerdict() {
 
   const score = Object.keys(rubric.criteria).reduce((a, k) => a + report.scores[k], 0);
   // Harness files (.claude/) never ride along with an iteration commit; rollback excludes them too.
-  git(['add', '-A', '--', '.', ':(exclude).claude']);
+  git(['add', '-A', '--', ...COMMIT_SPEC]);
   git(['commit', '--allow-empty', '--no-verify', '-m', `gauntlet: iter ${n} score ${score}`]);
   const sha = git(['rev-parse', 'HEAD']).out;
 
@@ -524,6 +685,7 @@ export function cmdRecordVerdict() {
   sc.score_history.push(score);
   if (score > sc.best.score) sc.best = { iteration: n, score, sha };
   sc.gate_attempts_current = 0;
+  sc.gate_tree = null;
 
   const dest = path.join(P.history, `iter-${n}`);
   fs.mkdirSync(dest, { recursive: true });
@@ -531,10 +693,9 @@ export function cmdRecordVerdict() {
   fs.rmSync(P.inbox, { recursive: true, force: true });
   fs.mkdirSync(P.inbox, { recursive: true });
 
-  const last3 = sc.score_history.slice(-3);
   if (score >= sc.pass_threshold && report.blockers.length === 0) terminal(sc, 'APPROVED');
   else if (sc.iteration >= sc.max_iterations) terminal(sc, 'HALTED_MAX_ITER');
-  else if (sc.iteration >= 3 && Math.max(...last3) - Math.min(...last3) <= sc.plateau_epsilon) terminal(sc, 'HALTED_PLATEAU');
+  else if (isPlateau(sc.score_history, sc.plateau_epsilon, sc.plateau_window || 3)) terminal(sc, 'HALTED_PLATEAU');
   save(sc);
   return `[GAUNTLET] iteration ${n} score ${score} -> ${sc.status}`;
 }
