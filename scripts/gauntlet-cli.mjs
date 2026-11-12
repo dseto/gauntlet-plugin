@@ -5,8 +5,9 @@
  * outside .gauntlet/inbox/. All child processes run without a shell (argument arrays) so pathspecs
  * and quotes survive on Windows. Every JSON write is atomic (temp file + rename).
  *
- * Subcommands: init, next-iteration, gate-attempt, builder-passed, mark-gate-failed,
- * mark-infra-failed, record-verdict, rollback-to-best, close, status.
+ * Subcommands: init, next-iteration, record-verdict, rollback-to-best, close, status.
+ * The gate transitions (cmdGateAttempt, cmdBuilderPassed, cmdMark) are exported for the stop gate hook
+ * only and are deliberately not reachable from the command line.
  */
 /**
  * @typedef {object} Attempt
@@ -400,6 +401,11 @@ export function cmdInit(component, referencePath, rubricArg) {
   if (tests.status === 'infra') fail('[GAUNTLET] FAIL baseline test infra error:\n' + tests.log.slice(-2000));
   const warnings = [...build.warnings, ...tests.warnings];
   if (tests.failed.length) warnings.push(`baseline has ${tests.failed.length} failing test(s); only new failures will block`);
+  for (const id of tests.failed) {
+    if (id.endsWith('::<command>')) {
+      warnings.push(`baseline test command "${id.slice(0, -'::<command>'.length)}" fails without per-test ids (no junit): the test gate is inert for it and new failures will NOT block`);
+    }
+  }
 
   const origBranch = git(['rev-parse', '--abbrev-ref', 'HEAD']).out;
   const baseSha = git(['rev-parse', 'HEAD']).out;
@@ -598,15 +604,11 @@ export function main(argv) {
   switch (cmd) {
     case 'init': return cmdInit(pos[0], pos[1], rubricArg);
     case 'next-iteration': return cmdNextIteration();
-    case 'gate-attempt': return cmdGateAttempt();
-    case 'builder-passed': return cmdBuilderPassed();
-    case 'mark-gate-failed': return cmdMark('GATE_FAILED', pos.join(' '));
-    case 'mark-infra-failed': return cmdMark('HALTED_INFRA', pos.join(' '));
     case 'record-verdict': return cmdRecordVerdict();
     case 'rollback-to-best': return cmdRollback();
     case 'close': return cmdClose();
     case 'status': return cmdStatus();
-    default: fail('usage: gauntlet-cli <init|next-iteration|gate-attempt|builder-passed|mark-gate-failed|mark-infra-failed|record-verdict|rollback-to-best|close|status>');
+    default: fail('usage: gauntlet-cli <init|next-iteration|record-verdict|rollback-to-best|close|status>');
   }
 }
 

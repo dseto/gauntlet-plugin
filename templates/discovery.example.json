@@ -1,41 +1,11 @@
 {
   "schema_version": 1,
-  "discovered_at": "2026-10-17",
-  "runtime": {
-    "hooks": "node v24.12.0",
-    "python": "py -3.14 (.venv) = Python 3.14.2"
-  },
-  "claude_code_version": "2.1.296",
-  "git": {
-    "version": "2.50.1.windows.1",
-    "clean_at_discovery": true,
-    "branch": "main"
-  },
   "secret_files": [
     ".env"
   ],
-  "playwright": {
-    "mcp_plugin": true
-  },
-  "existing_harness": "none (greenfield: only docs/SPEC.md)",
   "hook_payload": {
-    "pretooluse_agent_type": true,
-    "subagentstop_agent_type": true,
-    "pretooluse_tool_name_for_subagents": "Agent (tool_input.subagent_type)",
-    "subagentstop_matcher_filters_agent_type": true,
-    "note": "Observed live 2026-10-15 (claude -p, HARNESS_DEBUG=1): subagent PreToolUse carries agent_id/agent_type (absent on main thread); SubagentStop carries agent_type, stop_hook_active, agent_transcript_path; matcher \"builder\" did not fire for Explore."
+    "pretooluse_agent_type": true
   },
-  "project": "BuscadorViagens",
-  "layout": "greenfield python app per docs/SPEC.md (src/, tests/, config/, scripts/)",
-  "source_dirs": [
-    "src",
-    "config",
-    "scripts"
-  ],
-  "test_dirs": [
-    "tests"
-  ],
-  "package_manager": "pip (.venv, py -3.14)",
   "commands": {
     "fast_lint": {
       "cmd": [
@@ -46,8 +16,7 @@
       ],
       "exts": [
         ".py"
-      ],
-      "note": "stdlib syntax check (project has no linter configured)"
+      ]
     },
     "build": "NONE",
     "test": [
@@ -66,7 +35,6 @@
     ]
   },
   "protected_files": [
-    "pytest.ini",
-    "docs/spec.md"
+    "pytest.ini"
   ]
 }

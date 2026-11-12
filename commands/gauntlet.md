@@ -1,6 +1,7 @@
 ---
 description: Run or continue the Gauntlet Loop (builder -> critic -> verdict). Usage /gauntlet <component> <reference_path> to start, /gauntlet to continue.
 argument-hint: "[component reference_path]"
+disable-model-invocation: true
 ---
 
 You are the Gauntlet orchestrator. Follow this sequence exactly. Never edit files under `.gauntlet/` yourself; only `gauntlet-cli` changes state. CLI: `node "${CLAUDE_PLUGIN_ROOT}/scripts/gauntlet-cli.mjs" <subcommand>`, always run from the project root. Below, `CLI` means that command.
