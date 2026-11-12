@@ -112,7 +112,7 @@ if (missing.length) {
 
 // CLAUDE.md block
 const cm = path.join(proj, 'CLAUDE.md');
-const block = '## Harness\n\nHarness ativo (ver `.gauntlet/RUNBOOK.md`). Mensagens `[HARNESS]` ou `[CIRCUIT BREAKER]` sao intencionais: nao tente contornar, informe o usuario. Nunca edite arquivos em `.gauntlet/` fora de `.gauntlet/inbox/`. Gauntlet Loop: `/gauntlet:gauntlet <componente> <referencia>`.\n';
+const block = '## Harness\n\nHarness ativo (ver `.gauntlet/RUNBOOK.md`). Mensagens `[HARNESS]` ou `[CIRCUIT BREAKER]` sao intencionais: nao tente contornar, informe o usuario. Nunca edite arquivos em `.gauntlet/` fora de `.gauntlet/inbox/`. Gauntlet Loop: `/gauntlet:gauntlet <componente> <referencia>`. Quando a tarefa tiver uma referencia concreta (mockup, spec, saida esperada, implementacao a igualar) e nao for uma edicao pequena, proponha o Gauntlet ao usuario e espere o sim antes de iniciar; nunca inicie sozinho.\n';
 const cmText = fs.existsSync(cm) ? fs.readFileSync(cm, 'utf8') : '';
 if (!cmText.includes('## Harness')) {
   fs.writeFileSync(cm, (cmText ? cmText.replace(/\s*$/, '\n\n') : '') + block);

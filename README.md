@@ -99,7 +99,9 @@ Or try without installing: `claude --plugin-dir C:\Projetos\gauntlet-plugin`.
    - `--migrate` replaces a legacy harness-kit install: it removes only the harness-kit files (the six hook files and `lib/common.mjs` in `.claude/hooks`, builder/critic agents, `/gauntlet` command, `.gauntlet/gauntlet-cli.mjs`) and their hook commands in `settings.json`. Your own hooks are left alone.
 2. `/gauntlet:gauntlet <component> <reference_path>` to start, `/gauntlet:gauntlet` to continue.
 
-Both commands are user-only (`disable-model-invocation`): the model cannot start them on its own.
+You do not have to type `/gauntlet:gauntlet` yourself. Describe the task with its reference ("rebuild the login form to match `docs/mockups/login.png`") and Claude proposes the loop; it starts only after you say yes. This relies on two things: the command `description`, which lists when to use it and when not to, and the `## Harness` block that `/gauntlet:init` writes to `CLAUDE.md`. Matching is probabilistic, so when Claude does not propose it, type the command. The command itself refuses to start if the model launched it without your confirmation.
+
+`/gauntlet:init` stays explicit (`disable-model-invocation`): it writes files into the project and, with `--migrate`, deletes legacy ones. Projects initialised before this change need the new `CLAUDE.md` sentence: delete the old `## Harness` block and re-run `/gauntlet:init`, or add it by hand.
 
 ## Practical examples
 

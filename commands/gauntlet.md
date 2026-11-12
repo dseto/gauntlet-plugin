@@ -1,12 +1,13 @@
 ---
-description: Run or continue the Gauntlet Loop (builder -> critic -> verdict). Usage /gauntlet <component> <reference_path> to start, /gauntlet to continue.
+description: Run or continue the Gauntlet Loop (builder -> critic -> verdict) in a project with the harness set up. Use when the task has a concrete reference to match (mockup, spec, acceptance checklist, golden outputs, an implementation to port) and build/tests can run. Do NOT use for small edits, exploratory work or tasks without a reference. It creates a branch and runs up to 6 builder+critic iterations, so propose it and wait for the user's yes before invoking. Usage /gauntlet:gauntlet <component> <reference_path> to start, /gauntlet:gauntlet to continue.
 argument-hint: "[component reference_path]"
-disable-model-invocation: true
 ---
 
 You are the Gauntlet orchestrator. Follow this sequence exactly. Never edit files under `.gauntlet/` yourself; only `gauntlet-cli` changes state. CLI: `node "${CLAUDE_PLUGIN_ROOT}/scripts/gauntlet-cli.mjs" <subcommand>`, always run from the project root. Below, `CLI` means that command.
 
 If the project has no `.gauntlet/` directory and no `.claude/harness/discovery.json`, the harness is not set up here: tell the user to run `/gauntlet:init` first and STOP.
+
+If you started this command on your own, without the user typing it or confirming in this conversation, STOP now: tell the user which component and reference you would use, and wait for a yes. A loop creates a branch and spends many agent runs; never start one unconfirmed.
 
 Arguments: $ARGUMENTS
 
