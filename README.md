@@ -77,21 +77,78 @@ Hooks are no-ops in projects that have neither, so installing the plugin globall
 
 ## Install
 
-From GitHub (the repo is private: needs a logged-in `gh`/git with access):
+Installing is two steps: add the marketplace (this repo), then install the plugin from it. Both take `--scope`, which decides where Claude Code records them. Use the same scope in both commands.
+
+| Scope | Recorded in | Applies to | Use when |
+|---|---|---|---|
+| `user` (default) | `~/.claude` | all your projects | you want Gauntlet everywhere |
+| `local` | `.claude/settings.local.json` (git-ignored) | only you, only this project | you want it in one project and nobody else forced to have it |
+| `project` | `.claude/settings.json` (committed) | everyone who clones this project | the whole team should have it |
+
+Run `local` and `project` from the root of the project.
+
+### Source
+
+The repo is private: GitHub installs need a logged-in `gh`/git with access.
+
+- **From GitHub:** `dseto/gauntlet-plugin`
+- **From a local clone:** `C:\Projetos\gauntlet-plugin`
+
+### Only one project (recommended to start)
+
+```powershell
+cd C:\Projetos\my-app
+```
+
+```powershell
+claude plugin marketplace add dseto/gauntlet-plugin --scope local
+```
+
+```powershell
+claude plugin install gauntlet@gauntlet-local --scope local
+```
+
+Restart the Claude Code session, then run `/gauntlet:init` in the project. Other projects do not see the `/gauntlet:*` commands.
+
+For a shared install (committed, whole team), use `--scope project` in both commands and commit the change to `.claude/settings.json`.
+
+### All projects
 
 ```powershell
 claude plugin marketplace add dseto/gauntlet-plugin
-claude plugin install gauntlet@gauntlet-local
 ```
-
-From a local clone:
 
 ```powershell
-claude plugin marketplace add C:\Projetos\gauntlet-plugin
 claude plugin install gauntlet@gauntlet-local
 ```
 
-Or try without installing: `claude --plugin-dir C:\Projetos\gauntlet-plugin`.
+Installing globally is safe: the hooks do nothing in projects that did not run `/gauntlet:init`. Those projects still list the `/gauntlet:*` commands, though.
+
+### Try without installing
+
+```powershell
+claude --plugin-dir C:\Projetos\gauntlet-plugin
+```
+
+Loads the plugin for that session only.
+
+### Update and remove
+
+Pass the same `--scope` you installed with. Restart the session afterwards.
+
+```powershell
+claude plugin marketplace update gauntlet-local
+```
+
+```powershell
+claude plugin update gauntlet@gauntlet-local --scope local
+```
+
+```powershell
+claude plugin uninstall gauntlet@gauntlet-local --scope local
+```
+
+Uninstalling the plugin does not undo `/gauntlet:init`: `.gauntlet/`, `.claude/harness/` and the `## Harness` block in `CLAUDE.md` stay in the project until you delete them.
 
 ## Use
 
