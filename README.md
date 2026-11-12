@@ -89,7 +89,7 @@ Run `local` and `project` from the root of the project.
 
 ### Source
 
-The repo is private: GitHub installs need a logged-in `gh`/git with access.
+The repo is public: GitHub installs need no login.
 
 - **From GitHub:** `dseto/gauntlet-plugin`
 - **From a local clone:** `C:\Projetos\gauntlet-plugin`
