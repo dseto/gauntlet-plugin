@@ -15,4 +15,4 @@ Set up the Gauntlet harness for the current project. Arguments: $ARGUMENTS
 node "${CLAUDE_PLUGIN_ROOT}/scripts/init.mjs" "<project root>" "<temp dir>/gauntlet-discovery.json" $ARGUMENTS
 ```
 
-5. Tell the user: commit the harness files (the Gauntlet loop needs a clean tree), and restart the Claude session so the plugin hooks apply. `--migrate` removes the old per-project copy (`.claude/hooks`, builder/critic agents, `/gauntlet` command, `.gauntlet/gauntlet-cli.mjs`, legacy hook entries) so hooks do not run twice.
+5. Tell the user: commit the harness files (the Gauntlet loop needs a clean tree), and restart the Claude session so the plugin hooks apply. `--migrate` removes the old per-project harness-kit copy (its six hook files and `lib/common.mjs` in `.claude/hooks`, builder/critic agents, `/gauntlet` command, `.gauntlet/gauntlet-cli.mjs`, and its hook commands in `settings.json`) so hooks do not run twice. The project's own hooks are left untouched.

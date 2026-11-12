@@ -4,7 +4,8 @@
 //   - copies the RUNBOOK to .gauntlet/RUNBOOK.md
 //   - adds secret_files deny rules to .claude/settings.json, .gitignore entries and a CLAUDE.md block
 //   - --migrate: removes the legacy per-project copy made by harness-kit/install.mjs
-//     (hook entries in settings.json, .claude/hooks, builder/critic agents, /gauntlet command, .gauntlet/gauntlet-cli.mjs)
+//     (its hook commands in settings.json, its files in .claude/hooks, builder/critic agents, /gauntlet command,
+//     .gauntlet/gauntlet-cli.mjs). Other hooks the project keeps in .claude/hooks or settings.json are left alone.
 // Hooks, agents, the command and the CLI come from the plugin and are never copied into the project.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -48,10 +49,24 @@ done.push('wrote .gauntlet/RUNBOOK.md');
 // settings.json: secret deny rules (+ legacy hook removal on --migrate)
 const sf = path.join(proj, '.claude', 'settings.json');
 const settings = fs.existsSync(sf) ? JSON.parse(fs.readFileSync(sf, 'utf8')) : {};
+// Files installed by harness-kit/install.mjs under .claude/hooks. --migrate removes only these, never the
+// whole directory or other hooks the project keeps there.
+const LEGACY_HOOK_FILES = [
+  'bash-guard.mjs', 'file-guard.mjs', 'orchestrator-breaker.mjs',
+  'fast-file-check.mjs', 'builder-stop-gate.mjs', 'anti-cheat-diff.mjs',
+];
+const legacyCmd = (c) => typeof c === 'string' && LEGACY_HOOK_FILES.some((f) => c.includes(`/.claude/hooks/${f}`));
 if (migrate && settings.hooks) {
   for (const [ev, entries] of Object.entries(settings.hooks)) {
-    const kept = entries.filter((e) => !JSON.stringify(e).includes('/.claude/hooks/'));
-    if (kept.length !== entries.length) done.push(`removed legacy ${ev} hook entries from settings.json`);
+    let removed = 0;
+    const kept = [];
+    for (const e of entries) {
+      if (!e || !Array.isArray(e.hooks)) { kept.push(e); continue; }
+      const inner = e.hooks.filter((h) => !legacyCmd(h && h.command));
+      removed += e.hooks.length - inner.length;
+      if (inner.length) kept.push({ ...e, hooks: inner });
+    }
+    if (removed) done.push(`removed ${removed} legacy ${ev} hook command(s) from settings.json`);
     if (kept.length) settings.hooks[ev] = kept; else delete settings.hooks[ev];
   }
   if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
@@ -67,7 +82,8 @@ done.push('updated .claude/settings.json');
 // legacy files
 if (migrate) {
   const legacy = [
-    ['.claude', 'hooks'],
+    ...LEGACY_HOOK_FILES.map((f) => ['.claude', 'hooks', f]),
+    ['.claude', 'hooks', 'lib', 'common.mjs'],
     ['.claude', 'agents', 'builder.md'],
     ['.claude', 'agents', 'critic.md'],
     ['.claude', 'commands', 'gauntlet.md'],
@@ -75,7 +91,12 @@ if (migrate) {
   ];
   for (const parts of legacy) {
     const p = path.join(proj, ...parts);
-    if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); done.push(`removed legacy ${parts.join('/')}`); }
+    if (fs.existsSync(p)) { fs.rmSync(p, { force: true }); done.push(`removed legacy ${parts.join('/')}`); }
+  }
+  // Drop the legacy folders only when nothing else lives there.
+  for (const parts of [['.claude', 'hooks', 'lib'], ['.claude', 'hooks']]) {
+    const d = path.join(proj, ...parts);
+    if (fs.existsSync(d) && fs.readdirSync(d).length === 0) { fs.rmdirSync(d); done.push(`removed empty ${parts.join('/')}`); }
   }
 }
 

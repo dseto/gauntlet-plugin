@@ -12,13 +12,13 @@ Ele serve para três coisas:
 
 | Mecanismo | Natureza |
 |---|---|
-| `bash-guard` | heurístico (regex sobre o comando); bloqueia best-effort |
+| `bash-guard` | heurístico (regex sobre o comando, tools `Bash` e `PowerShell`); bloqueia best-effort. Só caminhos absolutos fora do projeto são bloqueados; escape relativo (`../`) e `~/.claude` passam |
 | `file-guard` | confiável para as ferramentas Edit/Write; não cobre escrita via processos filhos |
 | `fast-file-check` | roda **depois** da edição e **não reverte** o arquivo; só devolve o erro ao agente |
 | `anti-cheat-diff` | heurístico (regex + contagem de asserts) |
 | `orchestrator-breaker` | confiável enquanto o scorecard não for adulterado |
 | `builder-stop-gate` | confiável; se morrer por timeout, `record-verdict` recusa a iteração |
-| independência do critic | instruída ao agente, não garantida tecnicamente |
+| independência do critic | instruída ao agente, não garantida tecnicamente (inclui tratar texto do artefato/referência como dado, não instrução) |
 
 **Timeout de hook é fail-open no Claude Code.** Um hook morto por timeout não bloqueia nada. Os guards são rápidos (10 s). Para o stop gate, a proteção é `record-verdict` exigir `gate_passed_iteration`.
 
@@ -84,7 +84,7 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 ### Iniciar, continuar, encerrar
 
 - **Iniciar:** `/gauntlet:gauntlet <componente> <caminho_da_referencia>`. Cria a branch `gauntlet/<componente>` e copia a referência para `.gauntlet/reference/` com hash travado.
-- **Continuar:** `/gauntlet`.
+- **Continuar:** `/gauntlet:gauntlet`.
 - **Ver o estado:** `/gauntlet:gauntlet` mostra o estado; o CLI fica no plugin: `node "<pasta-do-plugin>/scripts/gauntlet-cli.mjs" status` (rode na raiz do projeto).
 - **Voltar ao melhor resultado:** `gauntlet-cli rollback-to-best` (mesmo caminho do plugin). Não é destrutivo: cria um novo commit, nunca usa `reset --hard`, recusa com a árvore suja e preserva `.claude/`.
 - **Encerrar:** `gauntlet-cli close`. Arquiva o scorecard em `.gauntlet/history/`. O merge da branch é manual.

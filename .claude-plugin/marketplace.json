@@ -1,7 +1,7 @@
 {
   "name": "gauntlet-local",
   "owner": { "name": "danie" },
-  "metadata": { "description": "Local marketplace for the Gauntlet Loop plugin." },
+  "metadata": { "description": "Marketplace for the Gauntlet Loop plugin." },
   "plugins": [
     {
       "name": "gauntlet",
