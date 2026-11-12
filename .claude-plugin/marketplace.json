@@ -1,0 +1,12 @@
+{
+  "name": "gauntlet-local",
+  "owner": { "name": "danie" },
+  "metadata": { "description": "Local marketplace for the Gauntlet Loop plugin." },
+  "plugins": [
+    {
+      "name": "gauntlet",
+      "source": "./",
+      "description": "Gauntlet Loop + harness guardrails, opt-in per project via /gauntlet:init."
+    }
+  ]
+}

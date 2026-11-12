@@ -1,0 +1,7 @@
+{
+  "name": "gauntlet",
+  "version": "0.1.0",
+  "description": "Gauntlet Loop (builder -> critic -> verdict) with a fail-closed guardrail harness: bash/file guards, anti-cheat diff, stop gate and circuit breaker. Opt-in per project via /gauntlet:init.",
+  "author": { "name": "danie" },
+  "keywords": ["gauntlet", "harness", "guardrails", "loop", "critic", "builder"]
+}
