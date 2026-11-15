@@ -97,10 +97,14 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 | status | significado |
 |---|---|
 | `IN_PROGRESS` | loop rodando |
-| `APPROVED` | score >= 85 e nenhum blocker |
+| `APPROVED` | score >= 85, nenhum blocker e todos os requisitos comprovados por execução (`test`, `run` ou `browser`) |
 | `HALTED_MAX_ITER` | 6 iterações sem aprovação |
 | `HALTED_PLATEAU` | a melhor nota não subiu pelo menos 6 pontos nas últimas 3 iterações (só avaliado a partir da 4ª) |
 | `GATE_FAILED` | o builder falhou no stop gate 3 vezes seguidas |
 | `HALTED_INFRA` | timeout ou erro de infraestrutura (não é culpa do builder) |
+
+### Prova por requisito
+
+O critic reporta cada requisito da referência em `requirements` (`id`, `status` = `met`/`unmet`/`unverified`, `method` = `test`/`run`/`browser`/`static`, `evidence`). Só conta como comprovado `met` com `test`, `run` ou `browser`; `static` (ler o código) não prova nada. Cada requisito não comprovado vira blocker `<id> not proven (...)`, então o loop continua iterando e não aprova. IDs numerados da referência (R1, AC-2, FR-3.1...) são extraídos no `init`; um relatório que omita algum, ou que retire um id listado numa iteração anterior, é recusado. `status` mostra a evidência de cada requisito da última iteração.
 
 Qualquer status diferente de `IN_PROGRESS` deixa o loop em `terminal`: o circuit breaker bloqueia novos builders até um `close`.

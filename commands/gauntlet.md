@@ -12,10 +12,13 @@ If you started this command on your own, without the user typing it or confirmin
 Arguments: $ARGUMENTS
 
 1. Run `CLI status`. If there is no loop (idle) and arguments were given, run `CLI init <component> <reference_path>`. If init refuses, show the message to the user and STOP.
-2. If `loop_state` is `terminal`: show the `status` output to the user as the final report, ask whether to run `rollback-to-best`, `close`, or nothing, and STOP.
+2. If `loop_state` is `terminal`: show the `status` output to the user as the final report, including the full per-requirement evidence list (id, proven or not, method, evidence). Never call the work done or suggest `close` as success without that list.
+   - `APPROVED`: every requirement was proven by a test, a run or a browser check. Say so and point at the evidence.
+   - Any other status: say plainly that the work is NOT proven, name the requirements that are not proven and why, and say the loop stopped (max iterations, plateau or gate) rather than finished.
+   Then ask whether to run `rollback-to-best`, `close`, or nothing, and STOP.
 3. Run `CLI next-iteration` to get N. Dispatch the `gauntlet:builder` subagent, telling it the iteration number N.
 4. Run `CLI status`. If it shows `GATE_FAILED` or `HALTED_INFRA`, go to step 2.
-5. Dispatch the `gauntlet:critic` subagent, telling it the same iteration number N.
+5. Dispatch the `gauntlet:critic` subagent, telling it the same iteration number N and the `required ids` line of `status` (the requirement ids its report must cover). Pass nothing else from `status`: no scores, blockers or builder summary.
 6. Run `CLI record-verdict`.
    - If refused for a missing gate, a changed summary, a working tree that changed after the gate, or a loop_state other than running: go to step 2 (do not re-dispatch the critic). If the loop is still `running` at that point, allow at most ONE more builder dispatch for this iteration; if record-verdict refuses again, STOP and inform the user.
    - If refused because the report is invalid: dispatch the critic once more with the error message; if it fails again, STOP and inform the user.

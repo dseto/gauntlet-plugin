@@ -16,7 +16,8 @@ Benefits:
 
 | Benefit | How |
 |---|---|
-| Fewer false "done" | Approval needs score >= 85 **and** no blockers, from a separate critic. |
+| Fewer false "done" | Approval needs score >= 85, no blockers **and** every requirement proven by something that ran, from a separate critic. |
+| Proof, not opinion | The critic reports each requirement with `status`, `method` and `evidence`. Only `met` by `test`, `run` or `browser` counts; `static` (reading the code) does not. Every unproven requirement becomes a blocker, so the loop keeps iterating. Numbered ids in the reference (R1, AC-2, ...) must all be reported. |
 | Anti-cheat | The gate flags weakened tests and new suppressions (`noqa`, `ts-ignore`, `skip`/`xfail`, tests dropped from collection, snapshot edits, fewer asserts) and fails the round. With a junit report it also fails when fewer tests ran than at the baseline. |
 | What is scored is what is committed | The gate pins a hash of the tree it checked. `record-verdict` refuses to commit if anything changed afterwards. |
 | Bounded cost | At most 6 iterations. Stops early on a plateau (best score did not rise by at least 6 points over the last 3 iterations). |
@@ -191,7 +192,7 @@ Put the mockup in the repo (any path outside `.gauntlet/`), then:
 /gauntlet:gauntlet login-form docs/mockups/login.png
 ```
 
-The reference is copied to `.gauntlet/reference/` and hash-locked, so the builder cannot edit it to make the goal easier. The critic uses the Playwright tool for visual checks when available, otherwise it scores fidelity from code and marks the evidence `static-only`.
+The reference is copied to `.gauntlet/reference/` and hash-locked, so the builder cannot edit it to make the goal easier. The critic checks visual requirements with the Playwright plugin's browser tools when they are installed, or with a throwaway script that runs the code. A requirement it can only check by reading the code is `static`, which does not count as proof: it blocks approval until the builder makes it provable (usually a test).
 
 ### 3. Module from a spec
 
@@ -199,7 +200,7 @@ The reference is copied to `.gauntlet/reference/` and hash-locked, so the builde
 /gauntlet:gauntlet invoice-parser docs/specs/invoice-parser.md
 ```
 
-Every explicit requirement in the spec that is not met becomes a blocker, whatever the total score, so a 90-point artifact with one violated rule is not approved.
+Every explicit requirement in the spec that is not met, or not proven by running something, becomes a blocker, whatever the total score, so a 90-point artifact with one violated or unproven rule is not approved. Number the requirements (`R1.`, `AC-2:`) so the CLI can check that the critic reported each one.
 
 ### 4. Continue, inspect, finish
 

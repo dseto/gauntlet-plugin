@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { isPlateau, parseJunit, testCountDrops, spawnPlan } from '../scripts/gauntlet-cli.mjs';
+import { isPlateau, parseJunit, testCountDrops, spawnPlan, extractRequirementIds, unprovenRequirements, validateRequirements } from '../scripts/gauntlet-cli.mjs';
 import { antiCheat, isTestFile } from '../hooks/anti-cheat-diff.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -83,12 +83,28 @@ function builderWork(dir, n) {
   write(dir, '.gauntlet/inbox/builder_summary.json', { schema_version: 1, iteration: n, summary: 'work', changed_files: [], tests_added: [], remaining_risks: [] });
 }
 
-/** @param {string} dir @param {number} n */
-function criticReport(dir, n) {
+const PROVEN = [{ id: 'ACC-1', status: 'met', method: 'test', evidence: 'unit case0 passed' }];
+
+/**
+ * @param {string} dir @param {number} n
+ * @param {{ requirements?: unknown[], scores?: Record<string, number> }} [opts]
+ */
+function criticReport(dir, n, opts = {}) {
   write(dir, '.gauntlet/inbox/critic_report.json', {
-    schema_version: 1, iteration: n, scores: { functionality: 30, fidelity: 30, quality: 10 }, blockers: [], gaps: [], evidence: ['x'],
+    schema_version: 1, iteration: n, scores: opts.scores || { functionality: 30, fidelity: 30, quality: 10 },
+    requirements: opts.requirements || PROVEN, blockers: [], gaps: [], evidence: ['x'],
   });
 }
+
+/** Runs one full iteration (builder work, gate, critic) and records the verdict. */
+function iterate(/** @type {string} */ dir, /** @type {number} */ n, /** @type {Parameters<typeof criticReport>[2]} */ opts) {
+  builderWork(dir, n);
+  const g = gate(dir);
+  assert.equal(g.code, 0, g.out);
+  criticReport(dir, n, opts);
+  return cli(dir, 'record-verdict');
+}
+const HIGH = { functionality: 40, fidelity: 40, quality: 20 };
 
 test('plateau: an improving loop is not stopped', () => {
   assert.equal(isPlateau([78, 81, 84], 6), false, 'three scores are not enough to judge');
@@ -234,5 +250,75 @@ test('spawn plan: .cmd commands run through cmd.exe with arguments intact', { sk
     const v = spawnSync(npm.exe, npm.args, { cwd: dir, encoding: 'utf8', shell: false, windowsVerbatimArguments: true });
     assert.equal(v.status, 0, v.stderr);
     assert.match(v.stdout.trim(), /^\d+\.\d+\.\d+/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('requirements: numbered ids are read from the reference text, code fences ignored', () => {
+  const text = [
+    '# Spec', '## Requirements', '- R1. clamps t', '- **R2.** surface', '### AC-3: acceptance', '1. FR-4.1 nested',
+    'R5) bare line', '```', '- R9. inside a fence', '```', '- R1. duplicate', 'plain text mentioning R7 is not a requirement',
+  ].join('\n');
+  assert.deepEqual(extractRequirementIds(text), ['R1', 'R2', 'AC-3', 'FR-4.1', 'R5']);
+});
+
+test('requirements: reading the code is not proof', () => {
+  const reqs = [
+    { id: 'a', status: 'met', method: 'test', evidence: 'x' },
+    { id: 'b', status: 'met', method: 'run', evidence: 'x' },
+    { id: 'c', status: 'met', method: 'browser', evidence: 'x' },
+    { id: 'd', status: 'met', method: 'static', evidence: 'x' },
+    { id: 'e', status: 'unverified', method: 'test', evidence: 'x' },
+    { id: 'f', status: 'unmet', method: 'browser', evidence: 'x' },
+  ];
+  // @ts-ignore test data
+  assert.deepEqual(unprovenRequirements(reqs).map((r) => r.id), ['d', 'e', 'f']);
+  assert.match(validateRequirements([], []).join(), /non-empty/);
+  assert.match(validateRequirements([{ id: 'R1', status: 'met', method: 'test', evidence: 'short' }], []).join(), /evidence/);
+  assert.match(validateRequirements([{ id: 'R1', status: 'done', method: 'eyes', evidence: 'long enough text' }], []).join(), /status.*method/s);
+  assert.match(validateRequirements([{ id: 'R1', status: 'met', method: 'test', evidence: 'long enough text' }], ['R1', 'R2']).join(), /missing ids: R2/);
+});
+
+test('record-verdict: a high score with requirements proven only by reading code is not approved', () => {
+  const dir = makeProject();
+  try {
+    assert.equal(cli(dir, 'init', 'comp', 'ref.md').code, 0);
+    const staticOnly = [{ id: 'ACC-1', status: 'met', method: 'static', evidence: 'looks right in src/app.js:1' }];
+    const first = iterate(dir, 1, { scores: HIGH, requirements: staticOnly });
+    assert.equal(first.code, 0, first.out);
+    assert.match(first.out, /IN_PROGRESS \(1 requirement\(s\) not proven: ACC-1\)/);
+    const sc = scorecard(dir);
+    assert.equal(sc.loop_state, 'running', 'loop must keep iterating');
+    assert.ok(sc.attempts[0].blockers.some((/** @type {string} */ b) => b.startsWith('ACC-1 not proven (met, static)')), 'unproven requirement becomes a blocker');
+    assert.deepEqual(sc.attempts[0].unproven, ['ACC-1']);
+    const second = iterate(dir, 2, { scores: HIGH });
+    assert.match(second.out, /APPROVED \(all 1 requirements proven\)/);
+    assert.match(cli(dir, 'status').out, /ACC-1 \[proven\] met\/test: unit case0 passed/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('record-verdict: every numbered requirement of the reference must be reported, and none may drop later', () => {
+  const dir = makeProject();
+  try {
+    write(dir, 'ref.md', '# reference\n- R1. first\n- R2. second\n');
+    git(dir, ['commit', '-q', '-am', 'numbered ref']);
+    const init = cli(dir, 'init', 'comp', 'ref.md');
+    assert.match(init.out, /requirements to prove: R1, R2/);
+    assert.deepEqual(scorecard(dir).requirement_ids, ['R1', 'R2']);
+    const r1 = { id: 'R1', status: 'met', method: 'test', evidence: 'test R1 passed' };
+    const r2 = { id: 'R2', status: 'met', method: 'run', evidence: 'node cli.js printed ok' };
+    const extra = { id: 'ACC-1', status: 'unmet', method: 'browser', evidence: 'button missing in DOM snapshot' };
+    builderWork(dir, 1);
+    assert.equal(gate(dir).code, 0);
+    criticReport(dir, 1, { requirements: [r1] });
+    const refused = cli(dir, 'record-verdict');
+    assert.equal(refused.code, 1);
+    assert.match(refused.out, /invalid report.*missing ids: R2/);
+    assert.equal(scorecard(dir).iteration, 0, 'a refusal must not change state');
+    criticReport(dir, 1, { requirements: [r1, r2, extra] });
+    assert.equal(cli(dir, 'record-verdict').code, 0);
+    builderWork(dir, 2);
+    assert.equal(gate(dir).code, 0);
+    criticReport(dir, 2, { scores: HIGH, requirements: [r1, r2] });
+    assert.match(cli(dir, 'record-verdict').out, /missing ids: ACC-1/, 'a requirement listed earlier cannot be dropped');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

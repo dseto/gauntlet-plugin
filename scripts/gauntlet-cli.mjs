@@ -16,8 +16,17 @@
  * @property {string} builder_summary text of the builder summary
  * @property {number} score
  * @property {Record<string, number>} breakdown
- * @property {string[]} blockers
+ * @property {string[]} blockers critic blockers plus one per requirement that is not proven
  * @property {string[]} gaps
+ * @property {Requirement[]} [requirements] per-requirement verdict of the critic
+ * @property {string[]} [unproven] ids of requirements that are not met with executed evidence
+ */
+/**
+ * @typedef {object} Requirement
+ * @property {string} id requirement id from the reference (e.g. R3) or one the critic assigned
+ * @property {'met'|'unmet'|'unverified'} status
+ * @property {'test'|'run'|'browser'|'static'} method how it was checked; `static` (reading code) is not proof
+ * @property {string} evidence test name, command + observed output, or browser observation
  */
 /**
  * @typedef {object} Scorecard
@@ -44,6 +53,7 @@
  * @property {Attempt[]} attempts
  * @property {string[]} [warnings]
  * @property {string} [halt_reason]
+ * @property {string[]} [requirement_ids] numbered requirements found in the reference at init; every report must cover them
  */
 /**
  * @typedef {object} CheckCommand
@@ -414,6 +424,81 @@ export function verifyRefLock() {
   if (JSON.stringify(lock) !== JSON.stringify(now)) fail('[GAUNTLET] FATAL reference tampered');
 }
 
+// ---------- requirements and evidence ----------
+
+const REQ_STATUS = ['met', 'unmet', 'unverified'];
+const REQ_METHOD = ['test', 'run', 'browser', 'static'];
+/** Methods that count as proof: something was executed and observed. Reading the code is not proof. */
+const PROOF_METHODS = ['test', 'run', 'browser'];
+const TEXT_REF = /\.(md|markdown|txt|rst|adoc)$/i;
+// A numbered requirement at the start of a line, after optional heading/bullet/bold markers:
+// "- R1. ...", "### AC-3: ...", "**REQ12)** ...", "1. FR-2 ...". The id must contain a digit.
+const REQ_LINE = /^\s*(?:#{1,6}\s*|[-*+]\s+|\d+[.)]\s+)?(?:\*\*|__)?\[?([A-Z]{1,5}-?\d+(?:\.\d+)*)\]?(?:\*\*|__)?[.:)-]?(?:\*\*|__)?\s/;
+
+/**
+ * Lists the numbered requirement ids (R1, AC-2, FR-3.1 ...) declared in the text files of a reference.
+ * @param {string} text reference text
+ * @returns {string[]} unique ids in order of appearance
+ */
+export function extractRequirementIds(text) {
+  /** @type {string[]} */
+  const ids = [];
+  let fence = false;
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) { fence = !fence; continue; }
+    if (fence) continue;
+    const m = REQ_LINE.exec(line);
+    if (m && !ids.includes(m[1])) ids.push(m[1]);
+  }
+  return ids;
+}
+
+/** @returns {string[]} requirement ids of all text files in the locked reference */
+function referenceRequirementIds() {
+  /** @type {string[]} */
+  const ids = [];
+  for (const f of listFiles(P.refDir)) {
+    if (!TEXT_REF.test(f)) continue;
+    for (const id of extractRequirementIds(fs.readFileSync(f, 'utf8'))) if (!ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Requirements the critic did not prove: anything not `met`, or `met` only by reading the code.
+ * @param {Requirement[]} reqs
+ * @returns {Requirement[]}
+ */
+export function unprovenRequirements(reqs) {
+  return reqs.filter((r) => r.status !== 'met' || !PROOF_METHODS.includes(r.method));
+}
+
+/**
+ * Validates the `requirements` list of a critic report.
+ * @param {any} reqs
+ * @param {string[]} requiredIds ids that must be present (from the reference and earlier iterations)
+ * @returns {string[]} errors (empty = valid)
+ */
+export function validateRequirements(reqs, requiredIds) {
+  /** @type {string[]} */
+  const e = [];
+  if (!Array.isArray(reqs) || reqs.length === 0) return ['requirements must be a non-empty array (one entry per requirement of the reference)'];
+  /** @type {Set<string>} */
+  const seen = new Set();
+  reqs.forEach((r, i) => {
+    const where = `requirements[${i}]`;
+    if (!r || typeof r.id !== 'string' || !r.id.trim()) { e.push(`${where}.id must be a non-empty string`); return; }
+    if (seen.has(r.id)) e.push(`${where}.id duplicated: ${r.id}`);
+    seen.add(r.id);
+    if (!REQ_STATUS.includes(r.status)) e.push(`${where}.status must be one of ${REQ_STATUS.join('|')}`);
+    if (!REQ_METHOD.includes(r.method)) e.push(`${where}.method must be one of ${REQ_METHOD.join('|')}`);
+    if (typeof r.evidence !== 'string' || r.evidence.trim().length < 10) e.push(`${where}.evidence must describe what was run and observed (at least 10 chars)`);
+  });
+  const missing = requiredIds.filter((id) => !seen.has(id));
+  if (missing.length) e.push(`requirements missing ids: ${missing.join(', ')}`);
+  return e;
+}
+
 // ---------- validation ----------
 
 /**
@@ -432,13 +517,14 @@ export function validateSummary(s, iteration) {
   return e;
 }
 /**
- * Validates critic_report.json: schema v1, iteration, scores keys/ranges per rubric, lists.
+ * Validates critic_report.json: schema v1, iteration, scores keys/ranges per rubric, lists, requirements.
  * @param {any} r parsed report
  * @param {number} iteration expected iteration
  * @param {Rubric} rubric
+ * @param {string[]} requiredIds requirement ids the report must cover
  * @returns {string[]} errors (empty = valid)
  */
-function validateReport(r, iteration, rubric) {
+export function validateReport(r, iteration, rubric, requiredIds) {
   /** @type {string[]} */
   const e = [];
   if (!r || r.schema_version !== 1) e.push('schema_version must be 1');
@@ -453,6 +539,7 @@ function validateReport(r, iteration, rubric) {
   if (!r || !Array.isArray(r.blockers)) e.push('blockers must be an array');
   if (!r || !Array.isArray(r.gaps) || r.gaps.length > 3) e.push('gaps must be an array with at most 3 items');
   if (!r || !Array.isArray(r.evidence) || r.evidence.length === 0) e.push('evidence must be a non-empty array');
+  e.push(...validateRequirements(r ? r.requirements : undefined, requiredIds));
   return e;
 }
 /**
@@ -544,6 +631,8 @@ export function cmdInit(component, referencePath, rubricArg) {
 
   const origBranch = git(['rev-parse', '--abbrev-ref', 'HEAD']).out;
   const baseSha = git(['rev-parse', 'HEAD']).out;
+  /** @type {string[]} */
+  let requirementIds = [];
   try {
     fs.rmSync(P.inbox, { recursive: true, force: true });
     fs.rmSync(P.refDir, { recursive: true, force: true });
@@ -553,6 +642,8 @@ export function cmdInit(component, referencePath, rubricArg) {
     else fs.copyFileSync(refAbs, path.join(P.refDir, path.basename(refAbs)));
     writeJsonAtomic(P.refLock, { schema_version: 1, files: hashRef() });
     writeJsonAtomic(P.rubric, rubric);
+    requirementIds = referenceRequirementIds();
+    if (!requirementIds.length) warnings.push('no numbered requirements (R1, AC-2, ...) found in the reference: the critic must list them itself, and later reports may not drop any');
     // Commit reference + lock + rubric on the gauntlet branch so they never leak as untracked files.
     git(['add', '--', '.gauntlet']);
     git(['commit', '--no-verify', '-m', `gauntlet: init ${component}`]);
@@ -566,6 +657,7 @@ export function cmdInit(component, referencePath, rubricArg) {
       baseline_failures: tests.failed, baseline_counts: tests.counts, warnings,
       gate_passed_iteration: null, builder_summary_sha256: null, gate_tree: null,
       best: { iteration: null, score: -1, sha: null }, score_history: [], attempts: [],
+      requirement_ids: requirementIds,
       created_at: new Date().toISOString(),
     });
   } catch (e) {
@@ -577,7 +669,9 @@ export function cmdInit(component, referencePath, rubricArg) {
     git(['branch', '-D', branch], { allowFail: true });
     fail(`[GAUNTLET] FAIL init aborted and rolled back: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return `[GAUNTLET] init ok: branch ${branch} (from ${origBranch} @ ${baseSha.slice(0, 10)})` + (warnings.length ? `\nWARN: ${warnings.join('; ')}` : '');
+  return `[GAUNTLET] init ok: branch ${branch} (from ${origBranch} @ ${baseSha.slice(0, 10)})`
+    + (requirementIds.length ? `\nrequirements to prove: ${requirementIds.join(', ')}` : '')
+    + (warnings.length ? `\nWARN: ${warnings.join('; ')}` : '');
 }
 
 /** @returns {string} iteration number the builder/critic must write (scorecard.iteration + 1) */
@@ -671,17 +765,28 @@ export function cmdRecordVerdict() {
   const rubric = readJson(P.rubric);
   const es = validateSummary(summary, n);
   if (es.length) fail('[GAUNTLET] FAIL builder_summary invalid: ' + es.join('; '));
-  const er = validateReport(report, n, rubric);
+  // Every id of the reference, plus every id an earlier report listed: a requirement can never silently drop out.
+  const requiredIds = [...(sc.requirement_ids || [])];
+  for (const a of sc.attempts) for (const r of a.requirements || []) if (!requiredIds.includes(r.id)) requiredIds.push(r.id);
+  const er = validateReport(report, n, rubric, requiredIds);
   if (er.length) fail('[GAUNTLET] FAIL critic_report invalid (invalid report): ' + er.join('; '));
 
   const score = Object.keys(rubric.criteria).reduce((a, k) => a + report.scores[k], 0);
+  /** @type {Requirement[]} */
+  const requirements = report.requirements.map((/** @type {Requirement} */ r) => ({ id: r.id, status: r.status, method: r.method, evidence: r.evidence }));
+  const unproven = unprovenRequirements(requirements);
+  // A requirement that is not proven is a blocker, so the next builder attacks it and approval is impossible.
+  const blockers = [...report.blockers, ...unproven.map((r) => `${r.id} not proven (${r.status}, ${r.method}): ${r.evidence}`)];
   // Harness files (.claude/) never ride along with an iteration commit; rollback excludes them too.
   git(['add', '-A', '--', ...COMMIT_SPEC]);
   git(['commit', '--allow-empty', '--no-verify', '-m', `gauntlet: iter ${n} score ${score}`]);
   const sha = git(['rev-parse', 'HEAD']).out;
 
   sc.iteration = n;
-  sc.attempts.push({ iteration: n, sha, builder_summary: summary.summary, score, breakdown: report.scores, blockers: report.blockers, gaps: report.gaps });
+  sc.attempts.push({
+    iteration: n, sha, builder_summary: summary.summary, score, breakdown: report.scores, blockers, gaps: report.gaps,
+    requirements, unproven: unproven.map((r) => r.id),
+  });
   sc.score_history.push(score);
   if (score > sc.best.score) sc.best = { iteration: n, score, sha };
   sc.gate_attempts_current = 0;
@@ -693,11 +798,12 @@ export function cmdRecordVerdict() {
   fs.rmSync(P.inbox, { recursive: true, force: true });
   fs.mkdirSync(P.inbox, { recursive: true });
 
-  if (score >= sc.pass_threshold && report.blockers.length === 0) terminal(sc, 'APPROVED');
-  else if (sc.iteration >= sc.max_iterations) terminal(sc, 'HALTED_MAX_ITER');
-  else if (isPlateau(sc.score_history, sc.plateau_epsilon, sc.plateau_window || 3)) terminal(sc, 'HALTED_PLATEAU');
+  const unprovenNote = unproven.length ? `${unproven.length} requirement(s) not proven: ${unproven.map((r) => r.id).join(', ')}` : '';
+  if (score >= sc.pass_threshold && blockers.length === 0) terminal(sc, 'APPROVED');
+  else if (sc.iteration >= sc.max_iterations) terminal(sc, 'HALTED_MAX_ITER', unprovenNote || undefined);
+  else if (isPlateau(sc.score_history, sc.plateau_epsilon, sc.plateau_window || 3)) terminal(sc, 'HALTED_PLATEAU', unprovenNote || undefined);
   save(sc);
-  return `[GAUNTLET] iteration ${n} score ${score} -> ${sc.status}`;
+  return `[GAUNTLET] iteration ${n} score ${score} -> ${sc.status}` + (unprovenNote ? ` (${unprovenNote})` : ` (all ${requirements.length} requirements proven)`);
 }
 
 /**
@@ -739,13 +845,29 @@ export function cmdStatus() {
   if (!sc) return 'loop_state: idle (no scorecard)';
   const next = sc.loop_state === 'running'
     ? `next: run builder for iteration ${sc.iteration + 1}`
-    : 'next: present report; then rollback-to-best (if applicable) or close';
+    : 'next: present report with the evidence of every requirement; then rollback-to-best (if applicable) or close';
+  const last = sc.attempts.length ? sc.attempts[sc.attempts.length - 1] : null;
+  const ids = [...(sc.requirement_ids || [])];
+  for (const a of sc.attempts) for (const r of a.requirements || []) if (!ids.includes(r.id)) ids.push(r.id);
+  /** @type {string[]} */
+  const evidence = [`required ids: ${ids.length ? ids.join(', ') : 'none numbered; the critic lists every requirement'}`];
+  if (last && last.requirements) {
+    const proven = last.requirements.length - (last.unproven || []).length;
+    evidence.push(`requirements (iter ${last.iteration}): ${proven}/${last.requirements.length} proven`);
+    for (const r of last.requirements) {
+      const mark = (last.unproven || []).includes(r.id) ? 'NOT PROVEN' : 'proven';
+      evidence.push(`  ${r.id} [${mark}] ${r.status}/${r.method}: ${r.evidence.replace(/\s+/g, ' ').slice(0, 240)}`);
+    }
+  } else if (last) {
+    evidence.push('requirements: none recorded (iteration scored before the evidence rule); nothing is proven');
+  }
   return [
     `component: ${sc.component}  branch: ${sc.branch}`,
     `loop_state: ${sc.loop_state}  status: ${sc.status}${sc.halt_reason ? ` (${sc.halt_reason})` : ''}`,
     `iteration: ${sc.iteration}/${sc.max_iterations}  threshold: ${sc.pass_threshold}  gate attempts: ${sc.gate_attempts_current}/${sc.gate_max_attempts}`,
     `scores: [${sc.score_history.join(', ')}]  best: ${sc.best.iteration === null ? 'none' : `iter ${sc.best.iteration} = ${sc.best.score}`}`,
     ...(sc.attempts.length ? [`last blockers: ${JSON.stringify(sc.attempts[sc.attempts.length - 1].blockers)}`, `last gaps: ${JSON.stringify(sc.attempts[sc.attempts.length - 1].gaps)}`] : []),
+    ...evidence,
     ...(sc.warnings && sc.warnings.length ? [`warnings: ${sc.warnings.join('; ')}`] : []),
     next,
   ].join('\n');
