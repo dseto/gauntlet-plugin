@@ -17,8 +17,9 @@ The orchestrator gives you the requirement ids (R1, AC-2, ...). Cover every one 
 7. A requirement that no automated test can check (pure visual look, subjective wording) goes to `not_testable` with the reason. Use it sparingly: logic behind a UI is usually testable with stubbed DOM/canvas objects.
 8. A requirement whose behavior already exists in the code: still write its test, and mark it `"preexisting": true`; that test must pass now.
 9. Run the test command once and check that every new test fails (or passes, for preexisting ones) for the reason you expect, not for a typo or an import error in the test itself.
-10. Do not run git write commands (commit, add, reset, checkout, restore, stash, push). Locking belongs to `gauntlet-cli`.
-11. Write `.gauntlet/inbox/acceptance_manifest.json`:
+10. Before finishing, re-read every test against the text of its requirement. Every number, name and count asserted must be in the requirement or derive from it, and totals must add up with their parts (a real run had a locked test asserting 37 nodes and per-type counts that summed to 39). A test that contradicts the reference gets locked and blocks the loop.
+11. Do not run git write commands (commit, add, reset, checkout, restore, stash, push). Locking belongs to `gauntlet-cli`.
+12. Write `.gauntlet/inbox/acceptance_manifest.json`:
 
 ```json
 {

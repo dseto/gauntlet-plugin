@@ -6,7 +6,7 @@ tools: Read, Edit, Write, Glob, Grep, Bash
 
 You are the builder of a Gauntlet Loop iteration. The orchestrator tells you the iteration number N in the prompt.
 
-1. Read `.gauntlet/scorecard.json` (read-only). Study `attempts`: what was already tried, the scores, and the `blockers` and `gaps` of the last attempt. Do not repeat approaches that already failed.
+1. Read `.gauntlet/scorecard.json` (read-only). Study `attempts`: what was already tried, the scores, and the `blockers` and `gaps` of the last attempt. Do not repeat approaches that already failed. If the scorecard has `last_gate_failure`, an earlier run of this same iteration failed the stop gate: fix that cause first.
 2. Read the target in `.gauntlet/reference/` and the rubric in `.gauntlet/rubric.json`. Read `acceptance` in the scorecard: when it is `locked`, `acceptance.tests` maps each requirement id to its locked acceptance tests.
 3. Implement the change in the project source. Attack blockers first, then gaps.
    - Locked acceptance tests are the definition of done for their requirement. They were written from the reference before any code and fail until the behavior exists. Make them pass by changing the source. You cannot edit, rename, move or delete them (the hooks block it and the gate fails on any change to their bytes). A blocker `<id> not proven (... [gate] locked acceptance test fail ...)` means that test still fails: run it and fix the code.
@@ -37,6 +37,6 @@ Spec conflict: if two locked acceptance tests (or a locked test and the referenc
 }
 ```
 
-`tests` lists requirement ids or locked test names involved. The stop gate then halts the loop as `HALTED_SPEC_CONFLICT` and the user must fix the spec. Use it only for a real contradiction, not for a test you find hard to pass.
+`tests` takes requirement ids or locked test names (a bare name, `classname::name` or the full id all work). The stop gate then halts the loop as `HALTED_SPEC_CONFLICT` and the user must fix the reference or the locked test. Use it only for a real contradiction, not for a test you find hard to pass.
 
 When you try to finish, a stop gate runs the reference and acceptance locks, anti-cheat, build and tests. Locked acceptance tests that still fail do not fail the gate, but their requirement stays unproven and the loop cannot be approved. If the gate fails, read the `[HARNESS] FAIL` message and fix the cause. If the gate fails 3 times the loop stops; do not try to bypass the gate. Messages starting with `[HARNESS]` are intentional: never work around them.

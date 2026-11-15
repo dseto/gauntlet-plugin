@@ -72,9 +72,10 @@ function checkSecrets(cmd, cfg) {
  * Checks one token a command may write to; blocks protected paths and paths outside the project.
  * @param {string} raw token
  * @param {import('./lib/common.mjs').HarnessConfig} cfg
+ * @param {boolean} [mkdirOnly] the segment is a plain mkdir, so naming the inbox folder itself is allowed
  * @returns {void}
  */
-function checkTarget(raw, cfg) {
+function checkTarget(raw, cfg, mkdirOnly = false) {
   const t = raw.replace(/^["'`]+|["'`]+$/g, '');
   if (!t || NULL_SINK_RE.test(t) || /^-/.test(t) || /^\d*>&?\d*$/.test(t)) return;
   const looksAbsolute = /^([a-zA-Z]:[\\/]|\/|~)/.test(t);
@@ -85,6 +86,7 @@ function checkTarget(raw, cfg) {
   if (cls === 'outside' && looksAbsolute && !underAllowedOutside(t)) {
     block(`[HARNESS] BLOCKED: write-like command touches a path outside the project: ${t}. Ask the user.`);
   }
+  if (mkdirOnly && rel === '.gauntlet/inbox') return;
   if (BLOCKED_CLASSES.has(cls)) {
     block(`[HARNESS] BLOCKED: write-like command touches protected path '${rel}' (${cls}). Only .gauntlet/inbox/ is writable by agents. Do not try alternative commands to bypass; ask the user.`);
   }
@@ -102,7 +104,8 @@ function checkWrites(cmd, cfg) {
   for (const m of cmd.matchAll(REDIRECT_TARGET_RE)) checkTarget(m[1], cfg);
   for (const seg of cmd.split(/[;|&\n]+/)) {
     if (!WRITE_VERB_RE.test(seg)) continue;
-    for (const t of tokens(seg.replace(REDIRECT_TARGET_RE, ' '))) checkTarget(t, cfg);
+    const mkdirOnly = /^\s*\(?mkdir\b/i.test(seg);
+    for (const t of tokens(seg.replace(REDIRECT_TARGET_RE, ' '))) checkTarget(t, cfg, mkdirOnly);
   }
 }
 

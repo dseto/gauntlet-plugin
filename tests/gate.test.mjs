@@ -249,13 +249,13 @@ test('init: refuses when the test command leaves files in the working tree', () 
 });
 
 test('spec conflict: an invalid declaration is refused; a valid one halts as HALTED_SPEC_CONFLICT and releases the builder', () => {
+  const reason = 'R1 wants an empty input rejected while the R2 example feeds an empty input and expects success; both cannot hold';
   const dir = makeProject();
   try {
     startNumbered(dir);
     specTester(dir);
     assert.equal(cli(dir, 'lock-acceptance').code, 0);
     assert.equal(cli(dir, 'next-iteration').out.trim(), '1');
-    const reason = 'R1 wants an empty input rejected while the R2 example feeds an empty input and expects success; both cannot hold';
 
     write(dir, '.gauntlet/inbox/spec_conflict.json', { schema_version: 1, iteration: 1, conflicts: [{ tests: ['test_made_up'], reason }] });
     const unknown = gate(dir);
@@ -276,9 +276,42 @@ test('spec conflict: an invalid declaration is refused; a valid one halts as HAL
     assert.equal(sc.loop_state, 'terminal');
     assert.equal(sc.status, 'HALTED_SPEC_CONFLICT');
     assert.match(cli(dir, 'status').out, /HALTED_SPEC_CONFLICT/);
+    assert.match(ok.out, /a locked test/, 'the halt says the fix may be in a locked test');
     const breaker = node(dir, BREAKER, [], JSON.stringify({ tool_input: { subagent_type: 'gauntlet:builder' } }));
     assert.equal(breaker.code, 2, 'no further builder after the halt');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+
+  // A locked test is named by requirement id, bare name, classname::name suffix or full junit id (one project each: a
+  // valid declaration ends the loop).
+  for (const name of ['R1', 'test_r1_feature', 't::test_r1_feature', 'unit::t::test_r1_feature']) {
+    const d = makeProject();
+    try {
+      startNumbered(d);
+      specTester(d);
+      assert.equal(cli(d, 'lock-acceptance').code, 0);
+      write(d, '.gauntlet/inbox/spec_conflict.json', { schema_version: 1, iteration: 1, conflicts: [{ tests: [name], reason }] });
+      const g = gate(d);
+      assert.equal(g.code, 0, `${name}: ${g.out}`);
+      assert.equal(scorecard(d).status, 'HALTED_SPEC_CONFLICT', name);
+    } finally { fs.rmSync(d, { recursive: true, force: true }); }
+  }
+
+  // A prefix of a locked name is not that test (test_r1 vs test_r10). Separate project: refusals count as gate attempts.
+  const dir2 = makeProject();
+  try {
+    startNumbered(dir2);
+    write(dir2, ACC_FILE, [{ name: 'test_r10', requires: 'src/feature.txt' }]);
+    write(dir2, '.gauntlet/inbox/acceptance_manifest.json', { schema_version: 1, tests: [{ id: 'R1', files: [ACC_FILE], names: ['test_r10'] }], not_testable: [NOT_TESTABLE_R2] });
+    assert.equal(cli(dir2, 'lock-acceptance').code, 0);
+    for (const name of ['test_r1', 'r10']) {
+      write(dir2, '.gauntlet/inbox/spec_conflict.json', { schema_version: 1, iteration: 1, conflicts: [{ tests: [name], reason }] });
+      const refused = gate(dir2);
+      assert.equal(refused.code, 2, `${name}: ${refused.out}`);
+      assert.match(refused.out, /not a locked test or requirement/);
+      assert.match(refused.out, /requirement id.*test name.*suffix.*full junit id/s, 'the refusal lists the accepted forms');
+      assert.equal(scorecard(dir2).status, 'IN_PROGRESS');
+    }
+  } finally { fs.rmSync(dir2, { recursive: true, force: true }); }
 });
 
 test('cwd guard: refuses the plugin folder and a folder without a harness, before any state change', () => {
@@ -580,5 +613,96 @@ test('acceptance: skip needs a reason and a clean tree; the spec-tester is block
     assert.equal(cli(dir, 'next-iteration').out.trim(), '1');
     const late = node(dir, BREAKER, [], JSON.stringify({ tool_input: { subagent_type: 'gauntlet:spec-tester' } }));
     assert.equal(late.code, 2, 'spec-tester only runs while acceptance is pending');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------- gate failure feedback ----------
+
+/** Adds a failing test case (with a long name, so the log is long) to a project whose gate was passing. */
+function breakTests(/** @type {string} */ dir) {
+  write(dir, 'results.json', { cases: [...cases('pass', 'pass', 'pass'), { name: `bad_${'x'.repeat(3000)}`, outcome: 'fail' }] });
+}
+
+test('gate failure: reason is stored, shown by status and cleared when the gate passes', () => {
+  const dir = makeProject();
+  try {
+    assert.equal(cli(dir, 'init', 'comp', 'ref.md').code, 0);
+    assert.doesNotMatch(cli(dir, 'status').out, /last gate failure/);
+    builderWork(dir, 1);
+    breakTests(dir);
+    const failed = gate(dir);
+    assert.equal(failed.code, 2, failed.out);
+    const f = scorecard(dir).last_gate_failure;
+    assert.equal(f.attempt, 1);
+    assert.equal(f.check, 'tests');
+    assert.match(f.log, /new failures/);
+    assert.ok(f.log.length > 0 && f.log.length <= 2000, `log length ${f.log.length}`);
+    assert.equal(scorecard(dir).schema_version, 1);
+    const st = cli(dir, 'status').out;
+    const line = st.split('\n').find((l) => l.startsWith('last gate failure'));
+    assert.ok(line, st);
+    assert.match(line, /^last gate failure \(attempt 1\/3\): tests: new failures:/);
+    assert.ok(line.length <= 'last gate failure (attempt 1/3): tests: '.length + 600, `line length ${line.length}`);
+    assert.match(st, /next: re-dispatch builder for iteration 1 with the gate failure above/);
+
+    write(dir, 'results.json', { cases: cases('pass', 'pass', 'pass') });
+    const ok = gate(dir);
+    assert.equal(ok.code, 0, ok.out);
+    assert.equal(scorecard(dir).last_gate_failure, undefined, 'a passing gate clears the failure');
+    const after = cli(dir, 'status').out;
+    assert.doesNotMatch(after, /last gate failure/);
+    assert.match(after, /next: run builder for iteration 1/);
+
+    // A stale record (the gate already passed for this iteration) is not shown, and record-verdict drops it.
+    const f2 = path.join(dir, '.gauntlet', 'scorecard.json');
+    const sc2 = JSON.parse(fs.readFileSync(f2, 'utf8'));
+    sc2.last_gate_failure = { attempt: 1, check: 'tests', log: 'old' };
+    fs.writeFileSync(f2, JSON.stringify(sc2, null, 2));
+    assert.doesNotMatch(cli(dir, 'status').out, /last gate failure/);
+    criticReport(dir, 1);
+    assert.equal(cli(dir, 'record-verdict').code, 0);
+    assert.equal(scorecard(dir).last_gate_failure, undefined, 'record-verdict drops a stale failure');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('gate failure: the third failure marks GATE_FAILED at once', () => {
+  const dir = makeProject();
+  try {
+    assert.equal(cli(dir, 'init', 'comp', 'ref.md').code, 0);
+    builderWork(dir, 1);
+    breakTests(dir);
+    assert.equal(gate(dir).code, 2, 'attempt 1 keeps the builder working');
+    assert.equal(gate(dir).code, 2, 'attempt 2 keeps the builder working');
+    assert.equal(scorecard(dir).loop_state, 'running');
+    const third = gate(dir);
+    assert.equal(third.code, 0, third.out);
+    assert.match(third.out, /gate attempt 3\/3: tests/);
+    const sc = scorecard(dir);
+    assert.equal(sc.loop_state, 'terminal');
+    assert.equal(sc.status, 'GATE_FAILED');
+    assert.match(sc.halt_reason, /tests/);
+    assert.equal(sc.last_gate_failure.attempt, 3);
+    assert.match(cli(dir, 'status').out, /GATE_FAILED/);
+    assert.doesNotMatch(cli(dir, 'status').out, /last gate failure/, 'a finished loop does not ask for a re-dispatch');
+    const breaker = node(dir, BREAKER, [], JSON.stringify({ tool_input: { subagent_type: 'gauntlet:builder' } }));
+    assert.equal(breaker.code, 2, 'no further builder after GATE_FAILED');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('bash-guard: the inbox folder itself is writable', () => {
+  const dir = makeProject();
+  try {
+    const BASH_GUARD = path.join(HERE, '..', 'hooks', 'bash-guard.mjs');
+    const guard = (/** @type {string} */ command) => node(dir, BASH_GUARD, [], JSON.stringify({ tool_name: 'Bash', tool_input: { command } }));
+    for (const c of ['mkdir -p .gauntlet/inbox', 'mkdir -p .gauntlet/inbox/', 'mkdir -p ./.gauntlet/inbox']) {
+      const r = guard(c);
+      assert.equal(r.code, 0, `${c}: ${r.out}`);
+    }
+    // Only creating the folder is allowed: moving, copying or deleting it, or walking out of it, is not.
+    for (const c of ['mkdir .gauntlet/other', 'rm -rf .gauntlet', 'mv .gauntlet/inbox ../gone', 'mv x .gauntlet/inbox',
+      'cp -r .gauntlet/inbox ../gone', 'mkdir -p .gauntlet/inbox/..']) {
+      const r = guard(c);
+      assert.equal(r.code, 2, `${c}: ${r.out}`);
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
