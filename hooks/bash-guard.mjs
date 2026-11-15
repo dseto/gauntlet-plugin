@@ -9,7 +9,7 @@
  */
 import os from 'node:os';
 import path from 'node:path';
-import { runGuard, readInput, loadConfig, normalizePath, classifyPath, block, ask, debugLog, isBuilderAgent } from './lib/common.mjs';
+import { runGuard, readInput, loadConfig, normalizePath, classifyPath, block, ask, debugLog, isBuilderAgent, isSpecTesterAgent } from './lib/common.mjs';
 
 const SECRET_RE = /(^|[\s"'`\/\\=(:,;])\.env(\.[\w.-]+)?(?=$|[\s"'`)\],;|&<>])/gi;
 const ALLOWED_ENV = /^\.env\.(example|sample|template)$/i;
@@ -20,7 +20,7 @@ const DESTRUCTIVE_GIT_RE = /\bgit\s+(reset\s+--hard|clean\s+-\w*f|checkout\s+--\
 const FORCE_PUSH_RE = /\bgit\s+push\b[^;|&]*(\s--force(-with-lease)?\b|\s-f\b|\s\+\S+)/i;
 const GIT_WRITE_RE = /\bgit\s+(commit|tag|reset|checkout|switch|restore|rebase|push|stash|merge|cherry-pick|revert|branch\s+-[dDmM])\b/i;
 const NULL_SINK_RE = /^(\/dev\/null|nul|\$null)$/i;
-const BLOCKED_CLASSES = new Set(['protected', 'claude', 'gauntlet', 'secret']);
+const BLOCKED_CLASSES = new Set(['protected', 'claude', 'gauntlet', 'secret', 'acceptance']);
 
 /**
  * True when an absolute path is under a temp dir or the user's ~/.claude (scratchpad, memory).
@@ -119,8 +119,8 @@ runGuard('bash-guard', () => {
   checkWrites(cmd, cfg);
 
   // Subagent calls carry agent_type (confirmed live); the main thread does not.
-  if (GIT_WRITE_RE.test(cmd) && isBuilderAgent(input.agent_type)) {
-    block('[HARNESS] BLOCKED: the builder must not run git write commands; commits belong to gauntlet-cli.');
+  if (GIT_WRITE_RE.test(cmd) && (isBuilderAgent(input.agent_type) || isSpecTesterAgent(input.agent_type))) {
+    block('[HARNESS] BLOCKED: loop agents (builder, spec-tester) must not run git write commands; commits belong to gauntlet-cli.');
   }
   if (RM_RECURSIVE_RE.test(cmd)) ask('[HARNESS] recursive delete requested; confirm the target is safe.');
   if (DESTRUCTIVE_GIT_RE.test(cmd)) ask('[HARNESS] destructive git command (discards changes); confirm.');

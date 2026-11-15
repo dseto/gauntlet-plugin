@@ -7,23 +7,30 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { isPlateau, parseJunit, testCountDrops, spawnPlan, extractRequirementIds, unprovenRequirements, validateRequirements } from '../scripts/gauntlet-cli.mjs';
+import {
+  isPlateau, parseJunit, testCountDrops, spawnPlan, extractRequirementIds, unprovenRequirements, validateRequirements,
+  matchTests, combinedOutcome, resolveProof, validateTestIds, validateManifest,
+} from '../scripts/gauntlet-cli.mjs';
 import { antiCheat, isTestFile } from '../hooks/anti-cheat-diff.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(HERE, '..', 'scripts', 'gauntlet-cli.mjs');
 const GATE = path.join(HERE, '..', 'hooks', 'builder-stop-gate.mjs');
 
-// Stand-in for pytest: writes the junit report asked for by --junitxml from results.json.
+// Stand-in for pytest: writes the junit report asked for by --junitxml from results.json, plus the cases
+// of every tests/*.json file (acceptance tests). A case with `requires` passes once that file exists.
 const FAKE_PYTEST = `
 import fs from 'node:fs';
 const out = (process.argv.find((a) => a.startsWith('--junitxml=')) || '').slice('--junitxml='.length);
 const r = JSON.parse(fs.readFileSync('results.json', 'utf8'));
 if (r.junk) fs.writeFileSync('junk.txt', String(Date.now()));
-const body = r.cases.map((c) => '<testcase classname="t" name="' + c.name + '">'
-  + (c.outcome === 'fail' ? '<failure/>' : c.outcome === 'skip' ? '<skipped/>' : '') + '</testcase>').join('');
+const all = [...r.cases];
+if (fs.existsSync('tests')) for (const f of fs.readdirSync('tests').sort()) if (f.endsWith('.json')) all.push(...JSON.parse(fs.readFileSync('tests/' + f, 'utf8')));
+const outcome = (c) => (c.requires ? (fs.existsSync(c.requires) ? 'pass' : 'fail') : c.outcome);
+const body = all.map((c) => '<testcase classname="t" name="' + c.name + '">'
+  + (outcome(c) === 'fail' ? '<failure/>' : outcome(c) === 'skip' ? '<skipped/>' : '') + '</testcase>').join('');
 if (out) fs.writeFileSync(out, '<testsuite>' + body + '</testsuite>');
-process.exit(r.cases.some((c) => c.outcome === 'fail') ? 1 : 0);
+process.exit(all.some((c) => outcome(c) === 'fail') ? 1 : 0);
 `;
 
 /** @param {string} dir @param {string[]} args */
@@ -83,7 +90,7 @@ function builderWork(dir, n) {
   write(dir, '.gauntlet/inbox/builder_summary.json', { schema_version: 1, iteration: n, summary: 'work', changed_files: [], tests_added: [], remaining_risks: [] });
 }
 
-const PROVEN = [{ id: 'ACC-1', status: 'met', method: 'test', evidence: 'unit case0 passed' }];
+const PROVEN = [{ id: 'ACC-1', status: 'met', method: 'test', test_id: 'case0', evidence: 'unit case0 passed' }];
 
 /**
  * @param {string} dir @param {number} n
@@ -119,7 +126,23 @@ test('plateau: an improving loop is not stopped', () => {
 test('junit: counts collected and skipped tests', () => {
   const r = parseJunit('<testsuite><testcase classname="a" name="x"/><testcase classname="a" name="y"><skipped type="pytest.xfail"/></testcase>'
     + '<testcase classname="a" name="z"><failure>boom</failure></testcase></testsuite>');
-  assert.deepEqual(r, { failed: ['a::z'], tests: 3, skipped: 1 });
+  assert.deepEqual(r, { failed: ['a::z'], cases: { 'a::x': 'pass', 'a::y': 'skip', 'a::z': 'fail' }, tests: 3, skipped: 1 });
+  assert.deepEqual(parseJunit('<testcase classname="a" name="q[x&amp;y]"/>').cases, { 'a::q[x&y]': 'pass' }, 'entities decoded');
+});
+
+test('junit: tests are found by bare name, suffix or full id, parametrized cases included', () => {
+  const results = /** @type {const} */ ({ 'unit::t::test_r1': 'pass', 'unit::t::test_r10': 'fail', 'unit::t::test_r2[a]': 'pass', 'unit::t::test_r2[b]': 'fail' });
+  assert.deepEqual(matchTests(results, 'test_r1'), ['unit::t::test_r1'], 'test_r1 must not match test_r10');
+  assert.deepEqual(matchTests(results, 't::test_r1'), ['unit::t::test_r1']);
+  assert.deepEqual(matchTests(results, 'unit::t::test_r10'), ['unit::t::test_r10']);
+  assert.deepEqual(matchTests(results, 'test_r2'), ['unit::t::test_r2[a]', 'unit::t::test_r2[b]']);
+  assert.deepEqual(matchTests(results, 'test_r'), []);
+  assert.deepEqual(matchTests(results, undefined), []);
+  assert.equal(combinedOutcome(results, ['unit::t::test_r1']), 'pass');
+  assert.equal(combinedOutcome(results, matchTests(results, 'test_r2')), 'fail', 'one failing parameter fails the set');
+  assert.equal(combinedOutcome(results, ['unit::t::gone']), 'missing');
+  assert.equal(combinedOutcome(results, []), 'missing');
+  assert.equal(combinedOutcome(null, ['unit::t::test_r1']), 'missing');
 });
 
 test('test count: fewer executed tests than the baseline is reported', () => {
@@ -225,6 +248,20 @@ test('init: refuses when the test command leaves files in the working tree', () 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('cwd guard: refuses the plugin folder and a folder without a harness, before any state change', () => {
+  const plugin = path.join(HERE, '..');
+  const r1 = node(plugin, CLI, ['status']);
+  assert.equal(r1.code, 1);
+  assert.match(r1.out, /not the plugin folder/);
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'gauntlet-bare-'));
+  try {
+    const r2 = cli(bare, 'status');
+    assert.equal(r2.code, 1);
+    assert.match(r2.out, /no harness in/);
+    assert.equal(fs.existsSync(path.join(bare, '.gauntlet')), false, 'no state created in a folder without harness');
+  } finally { fs.rmSync(bare, { recursive: true, force: true }); }
+});
+
 test('spawn plan: direct spawn off Windows and for real executables', () => {
   assert.deepEqual(spawnPlan(['npm', 'test'], process.cwd(), 'linux'), { exe: 'npm', args: ['test'], verbatim: false });
   const direct = spawnPlan([process.execPath, '-v'], process.cwd());
@@ -292,7 +329,7 @@ test('record-verdict: a high score with requirements proven only by reading code
     assert.deepEqual(sc.attempts[0].unproven, ['ACC-1']);
     const second = iterate(dir, 2, { scores: HIGH });
     assert.match(second.out, /APPROVED \(all 1 requirements proven\)/);
-    assert.match(cli(dir, 'status').out, /ACC-1 \[proven\] met\/test: unit case0 passed/);
+    assert.match(cli(dir, 'status').out, /ACC-1 \[proven by gate\] met\/test: \[gate\] case0 passed; critic met\/test: unit case0 passed/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -304,7 +341,8 @@ test('record-verdict: every numbered requirement of the reference must be report
     const init = cli(dir, 'init', 'comp', 'ref.md');
     assert.match(init.out, /requirements to prove: R1, R2/);
     assert.deepEqual(scorecard(dir).requirement_ids, ['R1', 'R2']);
-    const r1 = { id: 'R1', status: 'met', method: 'test', evidence: 'test R1 passed' };
+    assert.equal(cli(dir, 'skip-acceptance', 'covered', 'by', 'the', 'critic', 'in', 'this', 'test').code, 0);
+    const r1 = { id: 'R1', status: 'met', method: 'test', test_id: 'case0', evidence: 'test R1 passed' };
     const r2 = { id: 'R2', status: 'met', method: 'run', evidence: 'node cli.js printed ok' };
     const extra = { id: 'ACC-1', status: 'unmet', method: 'browser', evidence: 'button missing in DOM snapshot' };
     builderWork(dir, 1);
@@ -320,5 +358,194 @@ test('record-verdict: every numbered requirement of the reference must be report
     assert.equal(gate(dir).code, 0);
     criticReport(dir, 2, { scores: HIGH, requirements: [r1, r2] });
     assert.match(cli(dir, 'record-verdict').out, /missing ids: ACC-1/, 'a requirement listed earlier cannot be dropped');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------- acceptance tests (red-first, locked) and junit-backed proof ----------
+
+const FILE_GUARD = path.join(HERE, '..', 'hooks', 'file-guard.mjs');
+const BREAKER = path.join(HERE, '..', 'hooks', 'orchestrator-breaker.mjs');
+const ACC_FILE = 'tests/acceptance.json';
+const ACC_CASES = [{ name: 'test_r1_feature', requires: 'src/feature.txt' }];
+const NOT_TESTABLE_R2 = { id: 'R2', reason: 'visual look only, judged in the browser' };
+
+/** @param {string} dir @returns {string} init output; the loop runs with a numbered reference (R1, R2), acceptance pending */
+function startNumbered(dir) {
+  write(dir, 'ref.md', '# reference\n- R1. feature exists\n- R2. looks right\n');
+  git(dir, ['commit', '-q', '-am', 'numbered ref']);
+  const init = cli(dir, 'init', 'comp', 'ref.md');
+  assert.equal(init.code, 0, init.out);
+  return init.out;
+}
+
+/** @param {string} dir @param {unknown} [manifest] */
+function specTester(dir, manifest) {
+  write(dir, ACC_FILE, ACC_CASES);
+  write(dir, '.gauntlet/inbox/acceptance_manifest.json', manifest || {
+    schema_version: 1, tests: [{ id: 'R1', files: [ACC_FILE], names: ['test_r1_feature'] }], not_testable: [NOT_TESTABLE_R2],
+  });
+}
+
+test('acceptance manifest: every reference id once, tests or a reason', () => {
+  const ok = { schema_version: 1, tests: [{ id: 'R1', files: ['tests/a.py'], names: ['test_r1'] }], not_testable: [NOT_TESTABLE_R2] };
+  assert.deepEqual(validateManifest(ok, ['R1', 'R2']), []);
+  assert.match(validateManifest({ ...ok, not_testable: [] }, ['R1', 'R2']).join(), /not covered.*R2/);
+  assert.match(validateManifest({ ...ok, tests: [...ok.tests, { id: 'R9', files: ['tests/a.py'], names: ['x'] }] }, ['R1', 'R2']).join(), /R9 is not a requirement/);
+  assert.match(validateManifest({ ...ok, not_testable: [NOT_TESTABLE_R2, { id: 'R1', reason: 'duplicate entry here' }] }, ['R1', 'R2']).join(), /duplicated: R1/);
+  assert.match(validateManifest({ ...ok, not_testable: [{ id: 'R2', reason: 'eh' }] }, ['R1', 'R2']).join(), /reason/);
+  assert.match(validateManifest({ ...ok, tests: [{ id: 'R1', files: [], names: [] }] }, ['R1', 'R2']).join(), /files.*names/s);
+  assert.match(validateManifest({ schema_version: 1, tests: [], not_testable: [NOT_TESTABLE_R2, { id: 'R1', reason: 'nothing testable at all' }] }, ['R1', 'R2']).join(), /skip-acceptance/);
+});
+
+test('proof: a test claim counts only when that test passed at the gate', () => {
+  const gateResults = /** @type {const} */ ({ 'unit::t::test_r1': 'pass', 'unit::t::test_r2': 'fail', 'unit::t::test_acc': 'fail' });
+  const reqs = [
+    { id: 'R1', status: 'met', method: 'test', test_id: 'test_r1', evidence: 'passed locally' },
+    { id: 'R2', status: 'met', method: 'test', test_id: 'test_r2', evidence: 'claims it passed' },
+    { id: 'R3', status: 'met', method: 'browser', evidence: 'saw the button in the DOM' },
+    { id: 'R4', status: 'met', method: 'static', evidence: 'looks right in the code' },
+  ];
+  // @ts-ignore test data
+  const out = resolveProof(reqs, gateResults, {});
+  assert.deepEqual(out.map((r) => [r.id, r.proven, r.source]), [['R1', true, 'gate'], ['R2', false, 'gate'], ['R3', true, 'critic'], ['R4', false, 'critic']]);
+  assert.match(out[1].evidence, /\[gate\] test_r2 fail/);
+  // Without junit results the critic's word stands for `test` (projects with no junit report).
+  // @ts-ignore test data
+  assert.equal(resolveProof([reqs[1]], null, {})[0].proven, true);
+  // Locked acceptance tests decide their requirement; a critic `unmet` still overrides a pass.
+  const locked = { R1: ['unit::t::test_r1'], R5: ['unit::t::test_acc'] };
+  const lockedReqs = [
+    { id: 'R1', status: 'unverified', method: 'static', evidence: 'did not run anything' },
+    { id: 'R5', status: 'met', method: 'static', evidence: 'critic believes it works' },
+  ];
+  // @ts-ignore test data
+  assert.deepEqual(resolveProof(lockedReqs, gateResults, locked).map((r) => [r.id, r.proven, r.source, r.status]),
+    [['R1', true, 'acceptance', 'met'], ['R5', false, 'acceptance', 'unmet']]);
+  // @ts-ignore test data
+  assert.equal(resolveProof([{ id: 'R1', status: 'unmet', method: 'browser', evidence: 'wrong colour observed' }], gateResults, locked)[0].proven, false);
+  assert.match(validateTestIds([{ id: 'R1', status: 'met', method: 'test', evidence: 'xxxxxxxxxx' }], gateResults, {}).join(), /test_id is required/);
+  assert.match(validateTestIds([{ id: 'R1', status: 'met', method: 'test', test_id: 'nope', evidence: 'xxxxxxxxxx' }], gateResults, {}).join(), /did not run/);
+  assert.deepEqual(validateTestIds([{ id: 'R1', status: 'met', method: 'test', evidence: 'xxxxxxxxxx' }], gateResults, locked), [], 'locked ids need no test_id');
+  assert.deepEqual(validateTestIds([{ id: 'R1', status: 'met', method: 'test', evidence: 'xxxxxxxxxx' }], null, {}), [], 'no junit, no test_id rule');
+});
+
+test('record-verdict: a critic test claim is checked against the junit report of the gate', () => {
+  const dir = makeProject({ results: { cases: cases('pass', 'pass', 'fail') } });
+  try {
+    assert.equal(cli(dir, 'init', 'comp', 'ref.md').code, 0);
+    builderWork(dir, 1);
+    assert.equal(gate(dir).code, 0);
+    assert.equal(scorecard(dir).gate_results['unit::t::case0'], 'pass', 'gate stores the junit outcomes');
+    criticReport(dir, 1, { scores: HIGH, requirements: [{ id: 'ACC-1', status: 'met', method: 'test', evidence: 'it passed, trust me' }] });
+    assert.match(cli(dir, 'record-verdict').out, /test_id is required/);
+    criticReport(dir, 1, { scores: HIGH, requirements: [{ id: 'ACC-1', status: 'met', method: 'test', test_id: 'test_made_up', evidence: 'it passed, trust me' }] });
+    assert.match(cli(dir, 'record-verdict').out, /did not run in the junit report/);
+    criticReport(dir, 1, { scores: HIGH, requirements: [{ id: 'ACC-1', status: 'met', method: 'test', test_id: 'case2', evidence: 'case2 passed for me' }] });
+    const r = cli(dir, 'record-verdict');
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /IN_PROGRESS \(1 requirement\(s\) not proven: ACC-1\)/, 'a failing test proves nothing, whatever the critic says');
+    assert.equal(scorecard(dir).gate_results, null, 'gate results are consumed by the verdict');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('acceptance: red-first tests are locked before the builder and prove their requirement at the gate', () => {
+  const dir = makeProject();
+  try {
+    const initOut = startNumbered(dir);
+    assert.match(initOut, /spec-tester/);
+    assert.equal(scorecard(dir).acceptance.state, 'pending');
+    assert.match(cli(dir, 'status').out, /next: dispatch gauntlet:spec-tester/);
+    assert.match(cli(dir, 'next-iteration').out, /acceptance tests not locked/);
+    const early = node(dir, BREAKER, [], JSON.stringify({ tool_input: { subagent_type: 'gauntlet:builder' } }));
+    assert.equal(early.code, 2, 'breaker blocks a builder before the lock');
+
+    specTester(dir);
+    const lock = cli(dir, 'lock-acceptance');
+    assert.equal(lock.code, 0, lock.out);
+    assert.match(lock.out, /acceptance locked .*R1 \(1 test\); not testable: R2/);
+    const sc = scorecard(dir);
+    assert.equal(sc.acceptance.state, 'locked');
+    assert.deepEqual(sc.acceptance.tests, { R1: ['unit::t::test_r1_feature'] });
+    assert.ok(sc.baseline_failures.includes('unit::t::test_r1_feature'), 'red acceptance test may fail at the gate');
+    assert.deepEqual(sc.baseline_counts, { unit: { tests: 4, skipped: 0 } });
+    assert.match(git(dir, ['log', '-1', '--format=%s']), /lock acceptance tests \(R1\)/);
+    assert.equal(git(dir, ['status', '--porcelain']), '', 'tests committed, tree clean');
+    assert.equal(cli(dir, 'next-iteration').out.trim(), '1');
+    assert.match(cli(dir, 'status').out, /gate-proven by locked tests: R1 -> unit::t::test_r1_feature; critic must prove \(no automated test\): R2/);
+
+    // The hooks freeze the locked file while the loop runs.
+    const edit = node(dir, FILE_GUARD, [], JSON.stringify({ tool_name: 'Write', tool_input: { file_path: path.join(dir, ACC_FILE) } }));
+    assert.equal(edit.code, 2, edit.out);
+    assert.match(edit.out, /acceptance test locked/);
+
+    // Iteration 1: the feature does not exist; the critic's claim cannot override the red test.
+    const r2 = { id: 'R2', status: 'met', method: 'browser', evidence: 'opened the page, it looks like the mockup' };
+    const first = iterate(dir, 1, { scores: HIGH, requirements: [{ id: 'R1', status: 'met', method: 'static', evidence: 'feature code looks done' }, r2] });
+    assert.equal(first.code, 0, first.out);
+    assert.match(first.out, /IN_PROGRESS \(1 requirement\(s\) not proven: R1\)/);
+    assert.ok(scorecard(dir).attempts[0].blockers.some((/** @type {string} */ b) => /R1 not proven .*locked acceptance test fail/.test(b)));
+
+    // Iteration 2: tampering with the locked test fails the gate; restoring it and implementing passes.
+    builderWork(dir, 2);
+    write(dir, 'src/feature.txt', 'done\n');
+    write(dir, ACC_FILE, [{ name: 'test_r1_feature', outcome: 'pass' }]);
+    const tampered = gate(dir);
+    assert.equal(tampered.code, 2, tampered.out);
+    assert.match(tampered.out, /acceptance lock.*tests\/acceptance\.json/s);
+    write(dir, ACC_FILE, ACC_CASES);
+    const ok = gate(dir);
+    assert.equal(ok.code, 0, ok.out);
+    criticReport(dir, 2, { scores: HIGH, requirements: [{ id: 'R1', status: 'unverified', method: 'static', evidence: 'did not run it myself' }, r2] });
+    const second = cli(dir, 'record-verdict');
+    assert.match(second.out, /APPROVED \(all 2 requirements proven\)/, second.out);
+    assert.match(cli(dir, 'status').out, /R1 \[proven by acceptance\] met\/test/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('acceptance: lock refuses tests that pass before any code, extra edits and unknown names', () => {
+  const dir = makeProject();
+  try {
+    startNumbered(dir);
+    specTester(dir);
+    write(dir, ACC_FILE, [{ name: 'test_r1_feature', outcome: 'pass' }]);
+    assert.match(cli(dir, 'lock-acceptance').out, /passes before any implementation/, 'a tautological test is refused');
+
+    specTester(dir);
+    write(dir, 'src/app.js', 'export const a = 99;\n');
+    assert.match(cli(dir, 'lock-acceptance').out, /may only add the acceptance test files.*src\/app\.js/);
+    git(dir, ['checkout', '--', 'src/app.js']);
+
+    specTester(dir, { schema_version: 1, tests: [{ id: 'R1', files: [ACC_FILE], names: ['test_r1_typo'] }], not_testable: [NOT_TESTABLE_R2] });
+    assert.match(cli(dir, 'lock-acceptance').out, /no test named 'test_r1_typo' ran/);
+    specTester(dir, { schema_version: 1, tests: [{ id: 'R1', files: [ACC_FILE], names: ['test_r1_feature'] }] });
+    assert.match(cli(dir, 'lock-acceptance').out, /not covered.*R2/);
+    assert.equal(scorecard(dir).acceptance.state, 'pending', 'refusals change nothing');
+    assert.equal(git(dir, ['log', '-1', '--format=%s']), 'gauntlet: init comp');
+
+    // Behavior that already exists is locked as preexisting (green at lock).
+    write(dir, 'src/feature.txt', 'already here\n');
+    git(dir, ['add', 'src/feature.txt']);
+    git(dir, ['commit', '-q', '-m', 'feature predates the loop']);
+    specTester(dir, { schema_version: 1, tests: [{ id: 'R1', files: [ACC_FILE], names: ['test_r1_feature'], preexisting: true }], not_testable: [NOT_TESTABLE_R2] });
+    const pre = cli(dir, 'lock-acceptance');
+    assert.equal(pre.code, 0, pre.out);
+    assert.match(pre.out, /already passing: R1/);
+    assert.ok(!scorecard(dir).baseline_failures.includes('unit::t::test_r1_feature'), 'a green locked test must stay green');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('acceptance: skip needs a reason and a clean tree; the spec-tester is blocked outside the phase', () => {
+  const dir = makeProject();
+  try {
+    startNumbered(dir);
+    assert.equal(cli(dir, 'skip-acceptance').code, 1, 'reason required');
+    write(dir, ACC_FILE, ACC_CASES);
+    assert.match(cli(dir, 'skip-acceptance', 'user decided to skip it').out, /uncommitted changes.*tests\/acceptance\.json/);
+    fs.rmSync(path.join(dir, 'tests'), { recursive: true, force: true });
+    assert.equal(cli(dir, 'skip-acceptance', 'user decided to skip it').code, 0);
+    assert.match(cli(dir, 'status').out, /acceptance: skipped \(user decided to skip it\)/);
+    assert.equal(cli(dir, 'next-iteration').out.trim(), '1');
+    const late = node(dir, BREAKER, [], JSON.stringify({ tool_input: { subagent_type: 'gauntlet:spec-tester' } }));
+    assert.equal(late.code, 2, 'spec-tester only runs while acceptance is pending');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

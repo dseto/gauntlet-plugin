@@ -12,10 +12,11 @@ import path from 'node:path';
  * @property {string[]} [protected_files] project-relative frozen quality/config files
  * @property {{ fast_lint?: unknown, build?: unknown, test?: unknown }} [commands] discovered commands
  * @property {{ pretooluse_agent_type?: boolean }} [hook_payload] confirmed hook payload fields
+ * @property {string[]} [acceptance_files] locked acceptance tests of the running loop (added by loadConfig)
  */
 
 /**
- * @typedef {'outside'|'inbox'|'gauntlet'|'claude'|'secret'|'protected'|'ok'} PathClass
+ * @typedef {'outside'|'inbox'|'gauntlet'|'claude'|'secret'|'protected'|'acceptance'|'ok'} PathClass
  */
 
 /** @returns {string} absolute project root (CLAUDE_PROJECT_DIR or cwd) */
@@ -41,6 +42,14 @@ export function isEnabled() {
  */
 export function isBuilderAgent(t) {
   return t === 'builder' || t === 'gauntlet:builder';
+}
+
+/**
+ * @param {unknown} t agent_type or subagent_type
+ * @returns {boolean} true for the agent that writes the acceptance tests before the loop iterates
+ */
+export function isSpecTesterAgent(t) {
+  return t === 'spec-tester' || t === 'gauntlet:spec-tester';
 }
 
 /** @returns {boolean} true when the kill switch HARNESS_OFF=1 is set */
@@ -87,7 +96,22 @@ export function loadConfig() {
   const f = path.join(projectDir(), '.claude', 'harness', 'discovery.json');
   const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
   if (!cfg || typeof cfg !== 'object') throw new Error('discovery.json is not a JSON object');
+  cfg.acceptance_files = lockedAcceptanceFiles();
   return cfg;
+}
+
+/**
+ * Acceptance tests locked by the running loop. They are frozen only while that loop runs; after close
+ * (scorecard archived) they are ordinary tests again.
+ * @returns {string[]} project-relative paths (forward slashes); [] when none
+ * @throws {Error} when the scorecard exists but is corrupt (guards then fail closed)
+ */
+export function lockedAcceptanceFiles() {
+  const f = path.join(projectDir(), '.gauntlet', 'scorecard.json');
+  if (!fs.existsSync(f)) return [];
+  const sc = JSON.parse(fs.readFileSync(f, 'utf8'));
+  const a = sc && sc.loop_state === 'running' && sc.acceptance && sc.acceptance.state === 'locked' ? sc.acceptance.files : null;
+  return a && typeof a === 'object' ? Object.keys(a) : [];
 }
 
 /**
@@ -201,5 +225,6 @@ export function classifyPath(rel, cfg) {
   const lower = (/** @type {string[] | undefined} */ list) => (Array.isArray(list) ? list : []).map((s) => String(s).toLowerCase());
   if (lower(cfg.secret_files).includes(rel)) return 'secret';
   if (lower(cfg.protected_files).includes(rel)) return 'protected';
+  if (lower(cfg.acceptance_files).includes(rel)) return 'acceptance';
   return 'ok';
 }

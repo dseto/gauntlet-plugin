@@ -19,6 +19,8 @@ Ele serve para três coisas:
 | `orchestrator-breaker` | confiável enquanto o scorecard não for adulterado |
 | `builder-stop-gate` | confiável; se morrer por timeout, `record-verdict` recusa a iteração. Com relatório junit, falha também quando rodam menos testes que na baseline. É idempotente: parada repetida com a árvore igual não faz nada |
 | hash da árvore | `record-verdict` só faz o commit se a árvore de trabalho for a mesma que passou no gate; qualquer arquivo criado, alterado ou apagado depois (inclusive pelo critic) recusa a iteração |
+| lock dos testes de aceitação | confiável: hash de cada arquivo travado conferido no gate e no `record-verdict`; `file-guard`/`bash-guard` bloqueiam a edição enquanto o loop roda |
+| prova por junit | confiável para testes que aparecem no relatório junit do gate; o critic não consegue alegar `test` com um teste que não rodou ou falhou |
 | independência do critic | instruída ao agente, não garantida tecnicamente (inclui tratar texto do artefato/referência como dado, não instrução) |
 
 **Timeout de hook é fail-open no Claude Code.** Um hook morto por timeout não bloqueia nada. Os guards são rápidos (10 s). Para o stop gate, a proteção é `record-verdict` exigir `gate_passed_iteration`.
@@ -87,6 +89,7 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 ### Iniciar, continuar, encerrar
 
 - **Iniciar:** `/gauntlet:gauntlet <componente> <caminho_da_referencia>`. Cria a branch `gauntlet/<componente>` e copia a referência para `.gauntlet/reference/` com hash travado.
+- **Testes de aceitação:** com requisitos numerados e um comando de teste com junit, o `init` deixa `acceptance: pending`. O orquestrador despacha o `gauntlet:spec-tester`, que escreve testes novos a partir da referência (um ou mais por id, com o id no nome: `test_r1_...`) e o manifesto `.gauntlet/inbox/acceptance_manifest.json`. `gauntlet-cli lock-acceptance` só trava se os arquivos forem novos, nada mais mudou, todo id estiver coberto (ou em `not_testable` com motivo) e todos os testes **falharem** agora (os marcados `preexisting` precisam passar). Travados, entram no commit, ganham hash e viram falhas de baseline: o gate não exige todos de uma vez, mas o requisito só fica comprovado quando o teste passar. `gauntlet-cli skip-acceptance <motivo>` pula a fase (só com o sim do usuário e árvore limpa).
 - **Continuar:** `/gauntlet:gauntlet`.
 - **Ver o estado:** `/gauntlet:gauntlet` mostra o estado; o CLI fica no plugin: `node "<pasta-do-plugin>/scripts/gauntlet-cli.mjs" status` (rode na raiz do projeto).
 - **Voltar ao melhor resultado:** `gauntlet-cli rollback-to-best` (mesmo caminho do plugin). Não é destrutivo: cria um novo commit, nunca usa `reset --hard`, recusa com a árvore suja e preserva `.claude/`.
@@ -105,6 +108,12 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 
 ### Prova por requisito
 
-O critic reporta cada requisito da referência em `requirements` (`id`, `status` = `met`/`unmet`/`unverified`, `method` = `test`/`run`/`browser`/`static`, `evidence`). Só conta como comprovado `met` com `test`, `run` ou `browser`; `static` (ler o código) não prova nada. Cada requisito não comprovado vira blocker `<id> not proven (...)`, então o loop continua iterando e não aprova. IDs numerados da referência (R1, AC-2, FR-3.1...) são extraídos no `init`; um relatório que omita algum, ou que retire um id listado numa iteração anterior, é recusado. `status` mostra a evidência de cada requisito da última iteração.
+O critic reporta cada requisito da referência em `requirements` (`id`, `status` = `met`/`unmet`/`unverified`, `method` = `test`/`run`/`browser`/`static`, `evidence`, e `test_id` para `test`). Só conta como comprovado `met` com `test`, `run` ou `browser`; `static` (ler o código) não prova nada.
 
-Qualquer status diferente de `IN_PROGRESS` deixa o loop em `terminal`: o circuit breaker bloqueia novos builders até um `close`.
+Ordem de força da prova:
+
+1. **Teste de aceitação travado** que passou no junit do gate. Decide o requisito; o critic só derruba com um `unmet` observado.
+2. **`test_id` do critic** que passou no junit do gate. Se o gate tem junit, `met` por `test` sem `test_id`, ou com um teste que não rodou, é recusado; um teste que falhou deixa o requisito sem prova.
+3. **`run`/`browser`** do critic (ou `test` quando nenhum comando gera junit). Cada requisito não comprovado vira blocker `<id> not proven (...)`, então o loop continua iterando e não aprova. IDs numerados da referência (R1, AC-2, FR-3.1...) são extraídos no `init`; um relatório que omita algum, ou que retire um id listado numa iteração anterior, é recusado. `status` mostra a evidência de cada requisito da última iteração.
+
+Qualquer status diferente de `IN_PROGRESS` deixa o loop em `terminal`: o circuit breaker bloqueia novos builders até um `close`. Com `acceptance: pending`, o circuit breaker também bloqueia o builder até `lock-acceptance` ou `skip-acceptance`.
