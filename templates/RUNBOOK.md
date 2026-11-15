@@ -105,6 +105,7 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 | `HALTED_PLATEAU` | a melhor nota não subiu pelo menos 6 pontos nas últimas 3 iterações (só avaliado a partir da 4ª) |
 | `GATE_FAILED` | o builder falhou no stop gate 3 vezes seguidas |
 | `HALTED_INFRA` | timeout ou erro de infraestrutura (não é culpa do builder) |
+| `HALTED_SPEC_CONFLICT` | o builder declarou, em `.gauntlet/inbox/spec_conflict.json`, que testes de aceitação travados se contradizem (ou contradizem a referência). O loop para; a spec precisa ser corrigida pelo usuário. Para recomeçar: `close` e um novo `init` com outro nome de componente, depois de corrigir a referência |
 
 ### Prova por requisito
 

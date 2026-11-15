@@ -60,7 +60,7 @@
  * @typedef {object} Scorecard
  * @property {1} schema_version
  * @property {'idle'|'running'|'terminal'} loop_state
- * @property {string} status IN_PROGRESS | APPROVED | HALTED_MAX_ITER | HALTED_PLATEAU | GATE_FAILED | HALTED_INFRA
+ * @property {string} status IN_PROGRESS | APPROVED | HALTED_MAX_ITER | HALTED_PLATEAU | GATE_FAILED | HALTED_INFRA | HALTED_SPEC_CONFLICT
  * @property {string} component
  * @property {string} branch
  * @property {string} base_sha
@@ -117,6 +117,7 @@ export const P = {
   rubric: path.join(G, 'rubric.json'),
   inbox: path.join(G, 'inbox'),
   summary: path.join(G, 'inbox', 'builder_summary.json'),
+  conflict: path.join(G, 'inbox', 'spec_conflict.json'),
   report: path.join(G, 'inbox', 'critic_report.json'),
   manifest: path.join(G, 'inbox', 'acceptance_manifest.json'),
   history: path.join(G, 'history'),
@@ -1090,6 +1091,45 @@ export function cmdMark(status, reason) {
 }
 
 /**
+ * Records a spec conflict the builder declared in `.gauntlet/inbox/spec_conflict.json`: locked acceptance
+ * tests that cannot all pass (they contradict each other or the reference). The loop halts as
+ * HALTED_SPEC_CONFLICT instead of burning iterations on an impossible target; the spec must be fixed by the
+ * user (new init, new component). Each conflict names the locked tests or requirement ids it involves and
+ * explains why, so the user can check it. A declaration that is not valid is refused and the builder keeps working.
+ * @returns {string} message (no-op message when nothing is declared)
+ * @throws {CliError} when the declaration is invalid
+ */
+export function cmdSpecConflict() {
+  const sc = loadScorecard();
+  if (!sc || sc.loop_state !== 'running') return '[GAUNTLET] no running loop; spec conflict ignored';
+  if (!fs.existsSync(P.conflict)) return '[GAUNTLET] no spec conflict declared';
+  if (!sc.acceptance || sc.acceptance.state !== 'locked') fail('[GAUNTLET] FAIL spec conflict declared, but no acceptance tests are locked');
+  const d = readJson(P.conflict);
+  const n = sc.iteration + 1;
+  if (!d || typeof d !== 'object' || d.schema_version !== 1 || d.iteration !== n) {
+    fail(`[GAUNTLET] FAIL spec_conflict.json must have "schema_version": 1 and "iteration": ${n}`);
+  }
+  if (!Array.isArray(d.conflicts) || d.conflicts.length === 0) fail('[GAUNTLET] FAIL spec_conflict.json needs at least one conflict');
+  const locked = sc.acceptance.tests || {};
+  const known = new Set([...Object.keys(locked), ...Object.values(locked).flat()]);
+  for (const c of d.conflicts) {
+    if (!c || typeof c !== 'object' || !Array.isArray(c.tests) || c.tests.length === 0) {
+      fail('[GAUNTLET] FAIL each conflict must list the locked tests or requirement ids it involves ("tests": [...])');
+    }
+    const unknown = c.tests.filter((t) => typeof t !== 'string' || !known.has(t));
+    if (unknown.length) fail(`[GAUNTLET] FAIL conflict names something that is not a locked test or requirement: ${unknown.join(', ')}`);
+    if (typeof c.reason !== 'string' || c.reason.trim().length < 40) {
+      fail('[GAUNTLET] FAIL each conflict needs a reason of at least 40 characters explaining the contradiction');
+    }
+  }
+  const summary = d.conflicts.map((c) => c.tests.join(' + ')).join('; ');
+  terminal(sc, 'HALTED_SPEC_CONFLICT', `spec conflict: ${summary}`); save(sc);
+  const lines = d.conflicts.map((c) => ` - ${c.tests.join(' + ')}: ${String(c.reason).replace(/[^\x20-\x7e]/g, '?')}`);
+  return ['[GAUNTLET] status HALTED_SPEC_CONFLICT: the locked acceptance tests cannot all pass', ...lines,
+    'next: the spec needs a fix by the user; then close and init again with a new component name'].join('\n');
+}
+
+/**
  * True when the best score did not rise by at least `epsilon` over the last `window` iterations.
  * Compares the best of the last `window` scores with the best before them, so a loop that keeps
  * improving (78, 81, 84) is not stopped just because its recent scores are close together.
@@ -1307,9 +1347,10 @@ export function main(argv) {
     case 'next-iteration': return cmdNextIteration();
     case 'record-verdict': return cmdRecordVerdict();
     case 'rollback-to-best': return cmdRollback();
+    case 'spec-conflict': return cmdSpecConflict();
     case 'close': return cmdClose();
     case 'status': return cmdStatus();
-    default: fail('usage: gauntlet-cli <init|lock-acceptance|skip-acceptance|next-iteration|record-verdict|rollback-to-best|close|status>');
+    default: fail('usage: gauntlet-cli <init|lock-acceptance|skip-acceptance|next-iteration|record-verdict|rollback-to-best|spec-conflict|close|status>');
   }
 }
 

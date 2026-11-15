@@ -22,7 +22,7 @@ Arguments: $ARGUMENTS
    - Any other status: say plainly that the work is NOT proven, name the requirements that are not proven and why, and say the loop stopped (max iterations, plateau or gate) rather than finished.
    Then ask whether to run `rollback-to-best`, `close`, or nothing, and STOP.
 3. Run `CLI next-iteration` to get N. Dispatch the `gauntlet:builder` subagent, telling it the iteration number N.
-4. Run `CLI status`. If it shows `GATE_FAILED` or `HALTED_INFRA`, go to step 2.
+4. Run `CLI status`. If it shows `GATE_FAILED`, `HALTED_INFRA` or `HALTED_SPEC_CONFLICT`, go to step 2 (for a spec conflict, report the conflicts the CLI lists; the user must fix the spec, not the orchestrator).
 5. Dispatch the `gauntlet:critic` subagent, telling it the same iteration number N, the `required ids` line of `status` (the requirement ids its report must cover) and the `acceptance` line (which requirements locked tests decide). Pass nothing else from `status`: no scores, blockers or builder summary.
 6. Run `CLI record-verdict`.
    - If refused for a missing gate, a changed summary, a working tree that changed after the gate, or a loop_state other than running: go to step 2 (do not re-dispatch the critic). If the loop is still `running` at that point, allow at most ONE more builder dispatch for this iteration; if record-verdict refuses again, STOP and inform the user.

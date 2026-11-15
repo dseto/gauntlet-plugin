@@ -248,6 +248,39 @@ test('init: refuses when the test command leaves files in the working tree', () 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('spec conflict: an invalid declaration is refused; a valid one halts as HALTED_SPEC_CONFLICT and releases the builder', () => {
+  const dir = makeProject();
+  try {
+    startNumbered(dir);
+    specTester(dir);
+    assert.equal(cli(dir, 'lock-acceptance').code, 0);
+    assert.equal(cli(dir, 'next-iteration').out.trim(), '1');
+    const reason = 'R1 wants an empty input rejected while the R2 example feeds an empty input and expects success; both cannot hold';
+
+    write(dir, '.gauntlet/inbox/spec_conflict.json', { schema_version: 1, iteration: 1, conflicts: [{ tests: ['test_made_up'], reason }] });
+    const unknown = gate(dir);
+    assert.equal(unknown.code, 2, unknown.out);
+    assert.match(unknown.out, /spec conflict.*not a locked test or requirement/s);
+
+    write(dir, '.gauntlet/inbox/spec_conflict.json', { schema_version: 1, iteration: 1, conflicts: [{ tests: ['R1'], reason: 'too short' }] });
+    const short = gate(dir);
+    assert.equal(short.code, 2, short.out);
+    assert.match(short.out, /at least 40 characters/);
+    assert.equal(scorecard(dir).loop_state, 'running', 'refused declarations leave the loop running');
+
+    write(dir, '.gauntlet/inbox/spec_conflict.json', { schema_version: 1, iteration: 1, conflicts: [{ tests: ['R1'], reason }] });
+    const ok = gate(dir);
+    assert.equal(ok.code, 0, ok.out);
+    assert.match(ok.out, /status HALTED_SPEC_CONFLICT/);
+    const sc = scorecard(dir);
+    assert.equal(sc.loop_state, 'terminal');
+    assert.equal(sc.status, 'HALTED_SPEC_CONFLICT');
+    assert.match(cli(dir, 'status').out, /HALTED_SPEC_CONFLICT/);
+    const breaker = node(dir, BREAKER, [], JSON.stringify({ tool_input: { subagent_type: 'gauntlet:builder' } }));
+    assert.equal(breaker.code, 2, 'no further builder after the halt');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('cwd guard: refuses the plugin folder and a folder without a harness, before any state change', () => {
   const plugin = path.join(HERE, '..');
   const r1 = node(plugin, CLI, ['status']);
