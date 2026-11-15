@@ -1,12 +1,13 @@
 # gauntlet (Claude Code plugin)
 
-Gauntlet Loop (builder -> critic -> verdict) plus the fail-closed harness guardrails, packaged as a plugin.
+Gauntlet Loop (acceptance tests -> builder -> critic -> verdict) plus the fail-closed harness guardrails, packaged as a plugin.
 Replaces `harness-kit/install.mjs` copies.
 
 ## Why use it
 
 A single Claude session that builds something and then judges its own work tends to declare victory early. The Gauntlet Loop splits the job and makes the stopping rule mechanical:
 
+- **Spec-tester** (`gauntlet:spec-tester`) runs once, before any implementation, and writes one acceptance test per numbered requirement of the reference. The CLI locks them only if they **fail** now (red), then commits and hash-locks them. The builder must make them pass and can never edit them.
 - **Builder** (`gauntlet:builder`) implements one iteration toward a concrete reference and may not commit or touch `.gauntlet/` state.
 - **Stop gate** (a hook, not a prompt) runs when the builder finishes: reference lock, anti-cheat diff, build, tests. A builder that fails it three times in a row ends the loop as `GATE_FAILED`.
 - **Critic** (`gauntlet:critic`) scores the artifact against a rubric without reading the builder's own story, and lists blockers and gaps.
@@ -18,6 +19,8 @@ Benefits:
 |---|---|
 | Fewer false "done" | Approval needs score >= 85, no blockers **and** every requirement proven by something that ran, from a separate critic. |
 | Proof, not opinion | The critic reports each requirement with `status`, `method` and `evidence`. Only `met` by `test`, `run` or `browser` counts; `static` (reading the code) does not. Every unproven requirement becomes a blocker, so the loop keeps iterating. Numbered ids in the reference (R1, AC-2, ...) must all be reported. |
+| Tests the builder cannot bend | With numbered requirements and a junit test command, acceptance tests are written from the reference before any code, must be red when locked, and are hash-locked (hooks block edits, the gate fails on any byte change). A requirement with a locked test is proven only when that test passes in the gate's junit report; the critic can still veto it with an observed `unmet`. |
+| Test claims are checked | When the gate has a junit report, a critic `met` by `test` must name the test (`test_id`). The CLI looks it up in the report of the gate run: an unknown test is rejected, a failing one leaves the requirement unproven. |
 | Anti-cheat | The gate flags weakened tests and new suppressions (`noqa`, `ts-ignore`, `skip`/`xfail`, tests dropped from collection, snapshot edits, fewer asserts) and fails the round. With a junit report it also fails when fewer tests ran than at the baseline. |
 | What is scored is what is committed | The gate pins a hash of the tree it checked. `record-verdict` refuses to commit if anything changed afterwards. |
 | Bounded cost | At most 6 iterations. Stops early on a plateau (best score did not rise by at least 6 points over the last 3 iterations). |
@@ -52,13 +55,16 @@ Use it when there is a **concrete reference** the result can be compared with, a
         |
    init: clean tree + baseline build/tests, branch gauntlet/<component>, reference copied and hash-locked
         |
+   spec-tester --> lock-acceptance: new test files only, every id covered, all red -> committed + hash-locked
+        |          (only with numbered ids and a junit report; skip-acceptance with the user's yes)
    +--> next-iteration (N)
    |        |
-   |    builder (iteration N)  --> stop gate: reference lock, anti-cheat, build, tests
-   |        |                          (fails 3x in a row -> GATE_FAILED)
+   |    builder (iteration N)  --> stop gate: reference + acceptance locks, anti-cheat, build, tests
+   |        |                          (fails 3x in a row -> GATE_FAILED; junit outcomes stored)
    |    critic (iteration N)   --> scores + blockers + gaps
    |        |
-   |    record-verdict  --> APPROVED | next iteration | HALTED_MAX_ITER | HALTED_PLATEAU
+   |    record-verdict  --> proof from the gate's junit report, then
+   |                        APPROVED | next iteration | HALTED_MAX_ITER | HALTED_PLATEAU
    +--------+
 ```
 
@@ -69,7 +75,7 @@ The default rubric is `functionality` (40), `fidelity` (40) and `quality` (20). 
 | Piece | Path |
 |---|---|
 | Slash commands `/gauntlet:gauntlet`, `/gauntlet:init` | `commands/` |
-| Subagents `gauntlet:builder`, `gauntlet:critic` | `agents/` |
+| Subagents `gauntlet:spec-tester`, `gauntlet:builder`, `gauntlet:critic` | `agents/` |
 | Hooks (bash-guard, file-guard, orchestrator-breaker, fast-file-check, builder-stop-gate) | `hooks/` |
 | State machine CLI | `scripts/gauntlet-cli.mjs` |
 | Project opt-in script | `scripts/init.mjs` |
@@ -202,6 +208,8 @@ The reference is copied to `.gauntlet/reference/` and hash-locked, so the builde
 
 Every explicit requirement in the spec that is not met, or not proven by running something, becomes a blocker, whatever the total score, so a 90-point artifact with one violated or unproven rule is not approved. Number the requirements (`R1.`, `AC-2:`) so the CLI can check that the critic reported each one.
 
+Numbered requirements plus a test command with a junit report (`"junit": "pytest"` in `discovery.json`) turn on the acceptance phase. Before the first builder, the spec-tester writes `tests/acceptance/test_invoice_parser_acceptance.py` with tests such as `test_r1_rejects_negative_totals`, and `lock-acceptance` checks that they are new files, cover every id (or say why an id cannot be tested), and all fail. From then on R1 is proven only when `test_r1_rejects_negative_totals` passes in the gate's run, and nobody in the loop can edit that file. The lock lasts while the loop runs; after `close` they are ordinary tests.
+
 ### 4. Continue, inspect, finish
 
 Run the same command with no arguments to continue after a stop:
@@ -267,7 +275,8 @@ claude
 ## Guards
 
 - `bash-guard` runs for both the `Bash` and the `PowerShell` tools.
-- The CLI exposes only `init`, `next-iteration`, `record-verdict`, `rollback-to-best`, `close` and `status`. The gate transitions are exported for the stop gate hook and are not reachable from the command line.
+- The CLI exposes only `init`, `lock-acceptance`, `skip-acceptance`, `next-iteration`, `record-verdict`, `rollback-to-best`, `close` and `status`.
+- While acceptance is pending, `next-iteration`, `record-verdict` and the circuit breaker refuse builders; the spec-tester can only be dispatched then. Locked acceptance files are blocked for Edit/Write and shell writes while the loop runs. The gate transitions are exported for the stop gate hook and are not reachable from the command line.
 - `init` warns when a baseline test command fails without per-test ids (no junit): the test gate is inert for it. It also warns when a test command has no junit report, because the executed-test count cannot be checked then.
 - The stop gate is idempotent: a repeated stop with an unchanged tree does not re-run the checks, use up an attempt or delete the critic report.
 - On Windows, `.cmd`/`.bat` commands (`npm`, `npx`, `pnpm`, `yarn`) run through `cmd.exe` with escaped arguments; everything else is spawned directly, without a shell. A timeout kills `cmd.exe` but may leave its child process running.

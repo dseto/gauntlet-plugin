@@ -2,9 +2,11 @@
 /**
  * SubagentStop hook (matcher: builder) - quality gate for the Gauntlet builder.
  *
- * Checks, in order: reference lock, anti-cheat diff, build, tests (failures outside the baseline, and
- * fewer executed tests than the baseline), builder_summary.json. On success the checked working tree is
- * pinned by hash for record-verdict. exit 2 keeps the builder working, bounded by gate_max_attempts.
+ * Checks, in order: reference lock, acceptance-test lock, anti-cheat diff, build, tests (failures outside
+ * the baseline, and fewer executed tests than the baseline), builder_summary.json. On success the checked
+ * working tree is pinned by hash and the junit outcomes are stored for record-verdict. Locked acceptance
+ * tests that still fail do not fail the gate (they are baseline failures); they leave their requirement
+ * unproven at the verdict. exit 2 keeps the builder working, bounded by gate_max_attempts.
  * Infra problems (timeouts, missing executables) mark HALTED_INFRA instead of blaming the builder.
  * Unlike the guards, a crash here exits 0 (fail-closed would trap the builder in a loop); safety
  * comes from record-verdict refusing any iteration whose gate did not pass.
@@ -13,7 +15,7 @@ import fs from 'node:fs';
 import { isOff, isEnabled, isBuilderAgent, readInput, truncate, debugLog } from './lib/common.mjs';
 import { antiCheat } from './anti-cheat-diff.mjs';
 import {
-  ROOT, P, loadScorecard, loadConfig, readJson, verifyRefLock, runChecks, validateSummary,
+  ROOT, P, loadScorecard, loadConfig, readJson, verifyRefLock, verifyAcceptanceLock, runChecks, validateSummary,
   cmdGateAttempt, cmdBuilderPassed, cmdMark, gateStillValid, testCountDrops,
 } from '../scripts/gauntlet-cli.mjs';
 
@@ -71,6 +73,7 @@ function runGate(input) {
   const k = `${attempt}/${sc.gate_max_attempts}`;
 
   try { verifyRefLock(); } catch (e) { failGate(k, 'reference lock', e instanceof Error ? e.message : String(e)); }
+  try { verifyAcceptanceLock(sc); } catch (e) { failGate(k, 'acceptance lock', e instanceof Error ? e.message : String(e)); }
 
   const violations = antiCheat(ROOT, sc.base_sha);
   if (violations.length) failGate(k, 'anti-cheat', violations.map((v) => ' - ' + v).join('\n'));
@@ -98,8 +101,11 @@ function runGate(input) {
   const errs = validateSummary(summary, n);
   if (errs.length) failGate(k, 'builder_summary', errs.join('; '));
 
-  cmdBuilderPassed();
-  process.stdout.write(`[HARNESS] gate passed for iteration ${n}\n`);
+  cmdBuilderPassed(tests.results);
+  const locked = sc.acceptance && sc.acceptance.state === 'locked' ? sc.acceptance.tests || {} : {};
+  const red = Object.entries(locked).filter(([, ids]) => ids.some((id) => tests.results[id] !== 'pass')).map(([id]) => id);
+  process.stdout.write(`[HARNESS] gate passed for iteration ${n}`
+    + (red.length ? `; locked acceptance tests still failing: ${red.join(', ')}` : '') + '\n');
 }
 
 if (isOff() || !isEnabled()) process.exit(0);

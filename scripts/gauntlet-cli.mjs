@@ -5,9 +5,17 @@
  * outside .gauntlet/inbox/. All child processes run without a shell (argument arrays) so pathspecs
  * and quotes survive on Windows. Every JSON write is atomic (temp file + rename).
  *
- * Subcommands: init, next-iteration, record-verdict, rollback-to-best, close, status.
+ * Subcommands: init, lock-acceptance, skip-acceptance, next-iteration, record-verdict, rollback-to-best,
+ * close, status.
  * The gate transitions (cmdGateAttempt, cmdBuilderPassed, cmdMark) are exported for the stop gate hook
  * only and are deliberately not reachable from the command line.
+ *
+ * Proof of a requirement, strongest first:
+ *   1. a locked acceptance test (written from the reference before any implementation, red at lock,
+ *      hash-locked) that passed in the junit report of the gate run;
+ *   2. a test the critic names in `test_id` that passed in that same junit report;
+ *   3. the critic's own `run` / `browser` observation.
+ * Reading the code (`static`) never proves anything.
  */
 /**
  * @typedef {object} Attempt
@@ -27,7 +35,27 @@
  * @property {'met'|'unmet'|'unverified'} status
  * @property {'test'|'run'|'browser'|'static'} method how it was checked; `static` (reading code) is not proof
  * @property {string} evidence test name, command + observed output, or browser observation
+ * @property {string} [test_id] junit test the critic relies on for method `test` (name or classname::name)
+ * @property {'acceptance'|'gate'|'critic'} [source] who decided the proof (recorded by record-verdict)
+ * @property {boolean} [proven] recorded by record-verdict
  */
+/**
+ * @typedef {object} Acceptance
+ * @property {'pending'|'locked'|'skipped'|'unavailable'} state pending: spec-tester must write the tests first
+ * @property {Record<string, string[]>} [tests] requirement id -> junit case ids locked for it
+ * @property {Record<string, string>} [not_testable] requirement id -> why no automated test can check it
+ * @property {string[]} [preexisting] ids whose acceptance test already passed at lock (behavior existed before)
+ * @property {Record<string, string>} [files] acceptance test file -> SHA-256 at lock
+ * @property {string} [sha] commit holding the locked tests
+ * @property {string} [reason] why the phase was skipped or is unavailable
+ */
+/**
+ * @typedef {object} AcceptanceManifest written by the spec-tester in .gauntlet/inbox/acceptance_manifest.json
+ * @property {1} schema_version
+ * @property {{ id: string, files: string[], names: string[], preexisting?: boolean }[]} tests
+ * @property {{ id: string, reason: string }[]} [not_testable]
+ */
+/** @typedef {'pass'|'fail'|'skip'} Outcome outcome of one junit test case */
 /**
  * @typedef {object} Scorecard
  * @property {1} schema_version
@@ -54,6 +82,8 @@
  * @property {string[]} [warnings]
  * @property {string} [halt_reason]
  * @property {string[]} [requirement_ids] numbered requirements found in the reference at init; every report must cover them
+ * @property {Acceptance} [acceptance] acceptance-test phase (absent in loops started before it existed)
+ * @property {Record<string, Outcome> | null} [gate_results] junit outcomes of the gate run, by `command::classname::name`
  */
 /**
  * @typedef {object} CheckCommand
@@ -64,7 +94,10 @@
  * @property {'pytest'} [junit] reporter used to extract failing test ids
  */
 /** @typedef {{ tests: number, skipped: number }} TestCounts collected test cases and how many were skipped (xfail included) */
-/** @typedef {{ status: 'ok'|'fail'|'infra', failed: string[], log: string, warnings?: string[], counts?: Record<string, TestCounts> }} CheckResult */
+/**
+ * @typedef {{ status: 'ok'|'fail'|'infra', failed: string[], log: string, warnings?: string[], counts?: Record<string, TestCounts>,
+ *   results?: Record<string, Outcome> }} CheckResult results: every junit case by `command::classname::name`
+ */
 /** @typedef {{ schema_version: number, criteria: Record<string, { max: number, desc?: string }> }} Rubric */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -72,6 +105,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { antiCheat, isTestFile } from '../hooks/anti-cheat-diff.mjs';
 
 // The CLI ships inside the plugin, so the project is CLAUDE_PROJECT_DIR (hooks) or the cwd (orchestrator Bash calls).
 export const ROOT = path.resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd());
@@ -84,6 +118,7 @@ export const P = {
   inbox: path.join(G, 'inbox'),
   summary: path.join(G, 'inbox', 'builder_summary.json'),
   report: path.join(G, 'inbox', 'critic_report.json'),
+  manifest: path.join(G, 'inbox', 'acceptance_manifest.json'),
   history: path.join(G, 'history'),
   config: path.join(ROOT, '.claude', 'harness', 'discovery.json'),
 };
@@ -219,14 +254,16 @@ export function gateStillValid(sc) {
 function childTimeout(c) { return Math.max(60, Math.round((c.seconds || 0) * 2)) * 1000; }
 
 /**
- * Reads a JUnit XML report: failing test ids (`classname::name`), collected test cases and skipped ones
- * (pytest reports xfail as skipped).
+ * Reads a JUnit XML report: failing test ids (`classname::name`), the outcome of every case, collected
+ * test cases and skipped ones (pytest reports xfail as skipped).
  * @param {string} xml
- * @returns {{ failed: string[] } & TestCounts}
+ * @returns {{ failed: string[], cases: Record<string, Outcome> } & TestCounts}
  */
 export function parseJunit(xml) {
   /** @type {string[]} */
   const failed = [];
+  /** @type {Record<string, Outcome>} */
+  const cases = {};
   let tests = 0;
   let skipped = 0;
   const re = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
@@ -234,15 +271,52 @@ export function parseJunit(xml) {
   while ((m = re.exec(xml))) {
     const attrs = m[1];
     const body = m[3] || '';
+    /** @param {string} n @returns {string} */
+    const attr = (n) => unescapeXml((new RegExp(`\\b${n}="([^"]*)"`).exec(attrs) || [])[1] || '');
+    const id = `${attr('classname')}::${attr('name')}`;
     tests += 1;
-    if (/<skipped\b/.test(body)) skipped += 1;
-    if (/<(failure|error)\b/.test(body)) {
-      /** @param {string} n @returns {string} */
-      const attr = (n) => ((new RegExp(`\\b${n}="([^"]*)"`).exec(attrs) || [])[1] || '');
-      failed.push(`${attr('classname')}::${attr('name')}`);
-    }
+    /** @type {Outcome} */
+    let outcome = 'pass';
+    if (/<skipped\b/.test(body)) { skipped += 1; outcome = 'skip'; }
+    if (/<(failure|error)\b/.test(body)) { failed.push(id); outcome = 'fail'; }
+    // A name reported twice keeps its worst outcome (fail > skip > pass).
+    const prev = cases[id];
+    if (!prev || prev === 'pass' || (prev === 'skip' && outcome === 'fail')) cases[id] = outcome;
   }
-  return { failed, tests, skipped };
+  return { failed, cases, tests, skipped };
+}
+
+/** @param {string} s XML attribute value @returns {string} with the five predefined entities decoded */
+function unescapeXml(s) {
+  return s.replace(/&(lt|gt|quot|apos|amp);/g, (_, e) => ({ lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' })[/** @type {'lt'} */ (e)]);
+}
+
+/**
+ * Finds the junit cases a test reference names. A reference is a full id (`command::classname::name`),
+ * a `classname::name` suffix, or a bare test name; a bare name also matches its parametrized cases
+ * (`test_x[a]`).
+ * @param {Record<string, Outcome> | null | undefined} results gate or lock results
+ * @param {unknown} ref test name or id
+ * @returns {string[]} matching full ids (empty when none ran)
+ */
+export function matchTests(results, ref) {
+  if (!results || typeof ref !== 'string' || !ref.trim()) return [];
+  const r = ref.trim();
+  return Object.keys(results).filter((id) => id === r || id.endsWith(`::${r}`) || (id.includes(`::${r}[`) && id.endsWith(']')));
+}
+
+/**
+ * Combined outcome of a set of cases: missing when any did not run, then fail, then skip, else pass.
+ * @param {Record<string, Outcome> | null | undefined} results
+ * @param {string[]} ids full ids
+ * @returns {Outcome | 'missing'}
+ */
+export function combinedOutcome(results, ids) {
+  if (!results || !ids.length || ids.some((id) => !(id in results))) return 'missing';
+  const o = ids.map((id) => results[id]);
+  if (o.includes('fail')) return 'fail';
+  if (o.includes('skip')) return 'skip';
+  return 'pass';
 }
 
 /**
@@ -350,9 +424,15 @@ export function runCommand(c) {
     return { status: 'infra', failed: [], log: `${c.name}: ${code || r.error.message}\n${log}` };
   }
   const counts = junit ? { [c.name]: { tests: junit.tests, skipped: junit.skipped } } : undefined;
-  if (r.status === 0) return { status: 'ok', failed: [], log, counts };
+  /** @type {Record<string, Outcome> | undefined} */
+  let results;
+  if (junit) {
+    results = {};
+    for (const [id, o] of Object.entries(junit.cases)) results[`${c.name}::${id}`] = o;
+  }
+  if (r.status === 0) return { status: 'ok', failed: [], log, counts, results };
   const failed = junit && junit.failed.length ? junit.failed.map((id) => `${c.name}::${id}`) : [`${c.name}::<command>`];
-  return { status: 'fail', failed, log, counts };
+  return { status: 'fail', failed, log, counts, results };
 }
 
 /**
@@ -369,17 +449,18 @@ function cmdList(cfg, kind) {
  * Runs all commands of a kind. Stops at the first infra failure.
  * @param {any} cfg discovery config
  * @param {'build'|'test'} kind
- * @returns {CheckResult & { warnings: string[], counts: Record<string, TestCounts> }}
+ * @returns {CheckResult & { warnings: string[], counts: Record<string, TestCounts>, results: Record<string, Outcome> }}
  */
 export function runChecks(cfg, kind) {
   const list = cmdList(cfg, kind);
-  if (!list.length) return { status: 'ok', failed: [], log: '', warnings: [`${kind} command is NONE; skipped`], counts: {} };
-  /** @type {CheckResult & { warnings: string[], counts: Record<string, TestCounts> }} */
-  const out = { status: 'ok', failed: [], log: '', warnings: [], counts: {} };
+  if (!list.length) return { status: 'ok', failed: [], log: '', warnings: [`${kind} command is NONE; skipped`], counts: {}, results: {} };
+  /** @type {CheckResult & { warnings: string[], counts: Record<string, TestCounts>, results: Record<string, Outcome> }} */
+  const out = { status: 'ok', failed: [], log: '', warnings: [], counts: {}, results: {} };
   for (const c of list) {
     const r = runCommand(c);
     out.log += `--- ${c.name} (${r.status})\n${r.log}\n`;
     Object.assign(out.counts, r.counts || {});
+    Object.assign(out.results, r.results || {});
     if (r.status === 'infra') return { ...out, status: 'infra' };
     if (r.status === 'fail') { out.status = 'fail'; out.failed.push(...r.failed); }
   }
@@ -497,6 +578,132 @@ export function validateRequirements(reqs, requiredIds) {
   const missing = requiredIds.filter((id) => !seen.has(id));
   if (missing.length) e.push(`requirements missing ids: ${missing.join(', ')}`);
   return e;
+}
+
+/**
+ * When the gate produced junit results, a `met` by `test` claim must name the test it relies on, and
+ * that test must have run at the gate. Requirements with a locked acceptance test are decided by it.
+ * @param {any} reqs critic requirements (already shape-checked)
+ * @param {Record<string, Outcome> | null | undefined} gateResults
+ * @param {Record<string, string[]>} locked requirement id -> locked acceptance cases
+ * @returns {string[]} errors (empty = valid)
+ */
+export function validateTestIds(reqs, gateResults, locked) {
+  if (!gateResults || !Object.keys(gateResults).length || !Array.isArray(reqs)) return [];
+  /** @type {string[]} */
+  const e = [];
+  reqs.forEach((/** @type {any} */ r, /** @type {number} */ i) => {
+    if (!r || r.status !== 'met' || r.method !== 'test' || locked[r.id]) return;
+    const where = `requirements[${i}] (${r.id})`;
+    if (typeof r.test_id !== 'string' || !r.test_id.trim()) {
+      e.push(`${where}.test_id is required for method test: name the junit test (e.g. test_r3_rejects_empty) that proves it, or use method run/browser`);
+    } else if (!matchTests(gateResults, r.test_id).length) {
+      e.push(`${where}.test_id '${r.test_id}' did not run in the junit report of the gate run; name a test that ran, or use method run with the command and its output`);
+    }
+  });
+  return e;
+}
+
+/**
+ * Decides, per requirement, whether it is proven and by whom. A locked acceptance test that passed at
+ * the gate proves its requirement unless the critic observed it `unmet`; a critic `test` claim counts
+ * only when its `test_id` passed at the gate (when the gate has junit results); otherwise the critic's
+ * `run`/`browser` observation decides.
+ * @param {Requirement[]} reqs critic requirements
+ * @param {Record<string, Outcome> | null | undefined} gateResults
+ * @param {Record<string, string[]>} locked requirement id -> locked acceptance cases
+ * @returns {Requirement[]} normalized requirements with `source` and `proven`
+ */
+export function resolveProof(reqs, gateResults, locked) {
+  const junit = !!gateResults && Object.keys(gateResults).length > 0;
+  return reqs.map((r) => {
+    /** @type {Requirement} */
+    const base = { id: r.id, status: r.status, method: r.method, evidence: r.evidence };
+    if (typeof r.test_id === 'string' && r.test_id.trim()) base.test_id = r.test_id.trim();
+    const critic = `critic ${r.status}/${r.method}: ${r.evidence}`;
+    if (locked[r.id]) {
+      const o = combinedOutcome(gateResults, locked[r.id]);
+      const proven = o === 'pass' && r.status !== 'unmet';
+      const status = proven ? 'met' : (o === 'pass' ? r.status : 'unmet');
+      return { ...base, status, method: 'test', source: 'acceptance', proven,
+        evidence: `[gate] locked acceptance test ${o === 'pass' ? 'passed' : o} (${locked[r.id].join(', ')}); ${critic}` };
+    }
+    if (junit && r.status === 'met' && r.method === 'test') {
+      const ids = matchTests(gateResults, base.test_id);
+      const o = combinedOutcome(gateResults, ids);
+      return { ...base, status: o === 'pass' ? 'met' : 'unmet', source: 'gate', proven: o === 'pass',
+        evidence: `[gate] ${base.test_id || '(no test_id)'} ${o === 'pass' ? 'passed' : o}; ${critic}` };
+    }
+    return { ...base, source: 'critic', proven: r.status === 'met' && PROOF_METHODS.includes(r.method) };
+  });
+}
+
+/**
+ * Validates the spec-tester manifest: every reference id covered exactly once, by tests or by a reason
+ * why no automated test can check it; only reference ids.
+ * @param {any} m parsed manifest
+ * @param {string[]} requiredIds numbered ids of the reference
+ * @returns {string[]} errors (empty = valid)
+ */
+export function validateManifest(m, requiredIds) {
+  /** @type {string[]} */
+  const e = [];
+  if (!m || m.schema_version !== 1) e.push('schema_version must be 1');
+  const tests = m && Array.isArray(m.tests) ? m.tests : null;
+  const nt = m && m.not_testable === undefined ? [] : (m && Array.isArray(m.not_testable) ? m.not_testable : null);
+  if (!tests) e.push('tests must be an array');
+  if (!nt) e.push('not_testable must be an array when present');
+  if (!tests || !nt) return e;
+  if (!tests.length) e.push('tests is empty: nothing to lock (use skip-acceptance if no requirement can be tested automatically)');
+  /** @type {Set<string>} */
+  const seen = new Set();
+  /** @param {any} id @param {string} where */
+  const takeId = (id, where) => {
+    if (typeof id !== 'string' || !id.trim()) { e.push(`${where}.id must be a non-empty string`); return; }
+    if (seen.has(id)) e.push(`${where}.id duplicated: ${id}`);
+    if (!requiredIds.includes(id)) e.push(`${where}.id ${id} is not a requirement of the reference (${requiredIds.join(', ')})`);
+    seen.add(id);
+  };
+  /** @param {any} v @returns {boolean} */
+  const strList = (v) => Array.isArray(v) && v.length > 0 && v.every((s) => typeof s === 'string' && s.trim().length > 0);
+  tests.forEach((/** @type {any} */ t, /** @type {number} */ i) => {
+    const where = `tests[${i}]`;
+    takeId(t && t.id, where);
+    if (!t || !strList(t.files)) e.push(`${where}.files must be a non-empty array of project-relative paths`);
+    if (!t || !strList(t.names)) e.push(`${where}.names must be a non-empty array of test names`);
+    if (t && t.preexisting !== undefined && typeof t.preexisting !== 'boolean') e.push(`${where}.preexisting must be a boolean`);
+  });
+  nt.forEach((/** @type {any} */ t, /** @type {number} */ i) => {
+    const where = `not_testable[${i}]`;
+    takeId(t && t.id, where);
+    if (!t || typeof t.reason !== 'string' || t.reason.trim().length < 10) e.push(`${where}.reason must say why no automated test can check it (at least 10 chars)`);
+  });
+  const missing = requiredIds.filter((id) => !seen.has(id));
+  if (missing.length) e.push(`ids not covered (add a test or a not_testable reason): ${missing.join(', ')}`);
+  return e;
+}
+
+/**
+ * Compares the locked acceptance test files with their hashes at lock.
+ * @param {Scorecard} sc
+ * @returns {void}
+ * @throws {CliError} FATAL when a locked file was changed or removed
+ */
+export function verifyAcceptanceLock(sc) {
+  const a = sc.acceptance;
+  if (!a || a.state !== 'locked' || !a.files) return;
+  const bad = Object.entries(a.files).filter(([f, h]) => {
+    const abs = path.join(ROOT, f);
+    return !fs.existsSync(abs) || sha256File(abs) !== h;
+  }).map(([f]) => f);
+  if (bad.length) {
+    fail(`[GAUNTLET] FATAL locked acceptance test changed or removed: ${bad.join(', ')}. Restore it exactly; make the code pass the test instead.`);
+  }
+}
+
+/** @param {Scorecard} sc @returns {Record<string, string[]>} requirement id -> locked cases ({} when not locked) */
+function lockedTests(sc) {
+  return sc.acceptance && sc.acceptance.state === 'locked' && sc.acceptance.tests ? sc.acceptance.tests : {};
 }
 
 // ---------- validation ----------
@@ -633,6 +840,8 @@ export function cmdInit(component, referencePath, rubricArg) {
   const baseSha = git(['rev-parse', 'HEAD']).out;
   /** @type {string[]} */
   let requirementIds = [];
+  /** @type {Acceptance} */
+  let acceptance = { state: 'unavailable' };
   try {
     fs.rmSync(P.inbox, { recursive: true, force: true });
     fs.rmSync(P.refDir, { recursive: true, force: true });
@@ -644,6 +853,14 @@ export function cmdInit(component, referencePath, rubricArg) {
     writeJsonAtomic(P.rubric, rubric);
     requirementIds = referenceRequirementIds();
     if (!requirementIds.length) warnings.push('no numbered requirements (R1, AC-2, ...) found in the reference: the critic must list them itself, and later reports may not drop any');
+    // Acceptance tests are written before any implementation; they need ids to map and a junit report to read.
+    const junitCmds = cmdList(cfg, 'test').filter((c) => c.junit && tests.counts[c.name]);
+    if (requirementIds.length && junitCmds.length) acceptance = { state: 'pending' };
+    else {
+      const why = !requirementIds.length ? 'no numbered requirements in the reference' : 'no test command with a junit report';
+      acceptance = { state: 'unavailable', reason: why };
+      warnings.push(`acceptance tests unavailable (${why}): proof falls back to the critic's own runs`);
+    }
     // Commit reference + lock + rubric on the gauntlet branch so they never leak as untracked files.
     git(['add', '--', '.gauntlet']);
     git(['commit', '--no-verify', '-m', `gauntlet: init ${component}`]);
@@ -657,7 +874,7 @@ export function cmdInit(component, referencePath, rubricArg) {
       baseline_failures: tests.failed, baseline_counts: tests.counts, warnings,
       gate_passed_iteration: null, builder_summary_sha256: null, gate_tree: null,
       best: { iteration: null, score: -1, sha: null }, score_history: [], attempts: [],
-      requirement_ids: requirementIds,
+      requirement_ids: requirementIds, acceptance, gate_results: null,
       created_at: new Date().toISOString(),
     });
   } catch (e) {
@@ -671,12 +888,164 @@ export function cmdInit(component, referencePath, rubricArg) {
   }
   return `[GAUNTLET] init ok: branch ${branch} (from ${origBranch} @ ${baseSha.slice(0, 10)})`
     + (requirementIds.length ? `\nrequirements to prove: ${requirementIds.join(', ')}` : '')
+    + (acceptance.state === 'pending' ? '\nnext: dispatch gauntlet:spec-tester, then run lock-acceptance' : '')
     + (warnings.length ? `\nWARN: ${warnings.join('; ')}` : '');
+}
+
+/**
+ * @param {Scorecard} sc
+ * @returns {void}
+ * @throws {CliError} while the acceptance tests are still to be written and locked
+ */
+function requireAcceptanceSettled(sc) {
+  if (sc.acceptance && sc.acceptance.state === 'pending') {
+    fail('[GAUNTLET] FAIL acceptance tests not locked yet: dispatch gauntlet:spec-tester, then run lock-acceptance (or skip-acceptance with the user\'s yes)');
+  }
+}
+
+/**
+ * Paths that differ from HEAD in the working tree (tracked changes + untracked, ignored excluded),
+ * leaving out the harness and loop state.
+ * @returns {{ changed: string[], untracked: string[] }} forward-slash project-relative paths
+ */
+function pendingPaths() {
+  const tracked = git(['diff', '--name-only', 'HEAD']).out.split('\n').filter(Boolean);
+  const untracked = git(['ls-files', '--others', '--exclude-standard']).out.split('\n').filter(Boolean);
+  /** @param {string} p */
+  const mine = (p) => !p.startsWith('.gauntlet/') && !p.startsWith('.claude/');
+  return { changed: [...new Set([...tracked, ...untracked])].filter(mine), untracked: untracked.filter(mine) };
+}
+
+/**
+ * Locks the acceptance tests the spec-tester wrote from the reference: they must be new test files
+ * (nothing else changed), cover every requirement id of the reference (or say why it cannot be tested),
+ * pass anti-cheat and the build, leave the other tests as they were, and FAIL now (red) unless marked
+ * preexisting. On success they are committed, hash-locked, and their red cases join the baseline
+ * failures so the builder's gate does not demand them all at once.
+ * @returns {string} message
+ */
+export function cmdLockAcceptance() {
+  requireGit();
+  const sc = loadScorecard(); requireRunning(sc);
+  if (!sc.acceptance || sc.acceptance.state !== 'pending') fail(`[GAUNTLET] FAIL acceptance is ${sc.acceptance ? sc.acceptance.state : 'not part of this loop'}, expected pending`);
+  verifyRefLock();
+  if (!fs.existsSync(P.manifest)) fail('[GAUNTLET] FAIL .gauntlet/inbox/acceptance_manifest.json missing (the spec-tester writes it)');
+  /** @type {any} */
+  let m;
+  try { m = readJson(P.manifest); } catch { fail('[GAUNTLET] FAIL acceptance_manifest.json is not valid JSON'); }
+  const ids = sc.requirement_ids || [];
+  const me = validateManifest(m, ids);
+  if (me.length) fail('[GAUNTLET] FAIL acceptance manifest invalid: ' + me.join('; '));
+  /** @type {AcceptanceManifest} */
+  const manifest = m;
+  /** @param {string} f */
+  const norm = (f) => f.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  const files = [...new Set(manifest.tests.flatMap((t) => t.files.map(norm)))];
+  const outside = files.filter((f) => normalizedOutside(f));
+  if (outside.length) fail(`[GAUNTLET] FAIL acceptance files must be inside the project, outside .gauntlet/ and .claude/: ${outside.join(', ')}`);
+  const notTests = files.filter((f) => !isTestFile(f));
+  if (notTests.length) fail(`[GAUNTLET] FAIL acceptance files must be test files (tests/ dir, test_*.py, *.test.js, ...): ${notTests.join(', ')}`);
+
+  const cfg = loadConfig();
+  const build = runChecks(cfg, 'build');
+  if (build.status === 'infra') fail('[GAUNTLET] FAIL build infra error:\n' + build.log.slice(-2000));
+  if (build.status === 'fail') fail('[GAUNTLET] FAIL the acceptance tests break the build; they must compile and fail at run time\n' + build.log.slice(-2000));
+  const tests = runChecks(cfg, 'test');
+  if (tests.status === 'infra') fail('[GAUNTLET] FAIL test infra error:\n' + tests.log.slice(-2000));
+
+  // Scope is checked after the run, so files the new tests leave behind are caught too.
+  const { changed, untracked } = pendingPaths();
+  const extra = changed.filter((p) => !files.includes(p));
+  if (extra.length) fail(`[GAUNTLET] FAIL the spec-tester may only add the acceptance test files listed in the manifest; also changed: ${extra.join(', ')}`);
+  const notNew = files.filter((f) => !untracked.includes(f));
+  if (notNew.length) fail(`[GAUNTLET] FAIL acceptance files must be new, unignored files (existing tests are not rewritten): ${notNew.join(', ')}`);
+  const violations = antiCheat(ROOT, sc.base_sha);
+  if (violations.length) fail('[GAUNTLET] FAIL anti-cheat in the acceptance tests:\n' + violations.map((v) => ' - ' + v).join('\n'));
+
+  /** @type {Record<string, string[]>} */
+  const locked = {};
+  /** @type {string[]} */
+  const problems = [];
+  /** @type {string[]} */
+  const preexisting = [];
+  /** @type {string[]} */
+  const red = [];
+  for (const t of manifest.tests) {
+    /** @type {string[]} */
+    const cases = [];
+    for (const n of t.names) {
+      const found = matchTests(tests.results, n);
+      if (!found.length) problems.push(`${t.id}: no test named '${n}' ran (is the file collected? does it fail at import instead of inside the test?)`);
+      for (const id of found) if (!cases.includes(id)) cases.push(id);
+    }
+    for (const id of cases) {
+      const o = tests.results[id];
+      if (o === 'skip') problems.push(`${t.id}: ${id} was skipped; acceptance tests must run`);
+      else if (t.preexisting && o !== 'pass') problems.push(`${t.id}: ${id} is marked preexisting but does not pass`);
+      else if (!t.preexisting && o === 'pass') problems.push(`${t.id}: ${id} passes before any implementation, so it does not check the requirement (fix the test, or mark preexisting if the behavior already exists)`);
+      else if (o === 'fail') red.push(id);
+    }
+    locked[t.id] = cases;
+    if (t.preexisting) preexisting.push(t.id);
+  }
+  const baseline = new Set(sc.baseline_failures || []);
+  const broken = tests.failed.filter((id) => !baseline.has(id) && !red.includes(id));
+  if (broken.length) problems.push(`tests that passed at the baseline now fail: ${broken.join(', ')}`);
+  const drops = testCountDrops(sc.baseline_counts, tests.counts);
+  if (drops.length) problems.push(`fewer tests executed than at the baseline: ${drops.join('; ')}`);
+  if (problems.length) fail('[GAUNTLET] FAIL acceptance tests not locked:\n' + problems.map((p) => ' - ' + p).join('\n'));
+
+  /** @type {Record<string, string>} */
+  const hashes = {};
+  for (const f of files) hashes[f] = sha256File(path.join(ROOT, f));
+  git(['add', '--', ...files]);
+  git(['commit', '--no-verify', '-m', `gauntlet: lock acceptance tests (${Object.keys(locked).join(', ')})`]);
+  const sha = git(['rev-parse', 'HEAD']).out;
+  /** @type {Record<string, string>} */
+  const notTestable = {};
+  for (const t of manifest.not_testable || []) notTestable[t.id] = t.reason;
+  sc.acceptance = { state: 'locked', tests: locked, not_testable: notTestable, preexisting, files: hashes, sha };
+  sc.baseline_failures = [...(sc.baseline_failures || []), ...red];
+  sc.baseline_counts = tests.counts;
+  const dest = path.join(P.history, 'acceptance');
+  fs.mkdirSync(dest, { recursive: true });
+  fs.copyFileSync(P.manifest, path.join(dest, path.basename(P.manifest)));
+  fs.rmSync(P.manifest, { force: true });
+  save(sc);
+  return `[GAUNTLET] acceptance locked at ${sha.slice(0, 10)}: ${Object.entries(locked).map(([id, c]) => `${id} (${c.length} test${c.length === 1 ? '' : 's'})`).join(', ')}`
+    + (Object.keys(notTestable).length ? `; not testable: ${Object.keys(notTestable).join(', ')}` : '')
+    + (preexisting.length ? `; already passing: ${preexisting.join(', ')}` : '');
+}
+
+/** @param {string} f forward-slash path from the manifest @returns {boolean} true when outside the project or in harness dirs */
+function normalizedOutside(f) {
+  const abs = path.resolve(ROOT, f);
+  const rel = path.relative(ROOT, abs).split(path.sep).join('/');
+  return !rel || rel.startsWith('..') || path.isAbsolute(rel) || rel !== f || rel.startsWith('.gauntlet/') || rel.startsWith('.claude/');
+}
+
+/**
+ * Skips the acceptance phase (the user's decision, recorded with its reason). Proof falls back to the
+ * critic. Refuses with uncommitted changes so a half-written test suite never rides along.
+ * @param {string} reason why
+ * @returns {string} message
+ */
+export function cmdSkipAcceptance(reason) {
+  requireGit();
+  const sc = loadScorecard(); requireRunning(sc);
+  if (!sc.acceptance || sc.acceptance.state !== 'pending') fail(`[GAUNTLET] FAIL acceptance is ${sc.acceptance ? sc.acceptance.state : 'not part of this loop'}, expected pending`);
+  if (typeof reason !== 'string' || reason.trim().length < 10) fail('usage: skip-acceptance <reason, at least 10 chars>');
+  const left = pendingPaths().changed;
+  if (left.length) fail(`[GAUNTLET] FAIL working tree has uncommitted changes (remove the unlocked acceptance files first): ${left.join(', ')}`);
+  fs.rmSync(P.manifest, { force: true });
+  sc.acceptance = { state: 'skipped', reason: reason.trim().slice(0, 500) };
+  save(sc);
+  return '[GAUNTLET] acceptance phase skipped; proof falls back to the critic';
 }
 
 /** @returns {string} iteration number the builder/critic must write (scorecard.iteration + 1) */
 export function cmdNextIteration() {
-  const sc = loadScorecard(); requireRunning(sc);
+  const sc = loadScorecard(); requireRunning(sc); requireAcceptanceSettled(sc);
   return String(sc.iteration + 1);
 }
 
@@ -688,17 +1057,20 @@ export function cmdGateAttempt() {
 }
 
 /**
- * Records that the builder passed the gate: wipes any (forged) critic report, pins the summary hash and
- * the hash of the working tree that was checked.
+ * Records that the builder passed the gate: wipes any (forged) critic report, pins the summary hash,
+ * the hash of the working tree that was checked and the junit outcomes of that run (the proof
+ * record-verdict reads for `test` claims and locked acceptance tests).
+ * @param {Record<string, Outcome>} [results] junit outcomes of the gate's test run
  * @returns {string} message
  */
-export function cmdBuilderPassed() {
+export function cmdBuilderPassed(results) {
   const sc = loadScorecard(); requireRunning(sc);
   fs.rmSync(P.report, { force: true });
   if (!fs.existsSync(P.summary)) fail('[GAUNTLET] FAIL builder_summary.json missing');
   sc.gate_passed_iteration = sc.iteration + 1;
   sc.builder_summary_sha256 = sha256File(P.summary);
   sc.gate_tree = worktreeTreeHash();
+  sc.gate_results = results && Object.keys(results).length ? results : null;
   sc.gate_attempts_current = 0;
   save(sc);
   return `[GAUNTLET] gate passed for iteration ${sc.gate_passed_iteration}`;
@@ -739,7 +1111,7 @@ export function isPlateau(history, epsilon, window = 3) {
  */
 export function cmdRecordVerdict() {
   requireGit();
-  const sc = loadScorecard(); requireRunning(sc);
+  const sc = loadScorecard(); requireRunning(sc); requireAcceptanceSettled(sc);
   const n = sc.iteration + 1;
   if (sc.gate_passed_iteration !== n) fail('[GAUNTLET] FAIL builder gate did not pass for this iteration');
   if (!fs.existsSync(P.summary) || sha256File(P.summary) !== sc.builder_summary_sha256) fail('[GAUNTLET] FAIL builder_summary changed after the gate');
@@ -754,6 +1126,7 @@ export function cmdRecordVerdict() {
     }
   }
   verifyRefLock();
+  verifyAcceptanceLock(sc);
   if (!fs.existsSync(P.report)) fail('[GAUNTLET] FAIL critic_report.json missing (invalid report)');
   /** @type {any} */
   let summary;
@@ -768,13 +1141,15 @@ export function cmdRecordVerdict() {
   // Every id of the reference, plus every id an earlier report listed: a requirement can never silently drop out.
   const requiredIds = [...(sc.requirement_ids || [])];
   for (const a of sc.attempts) for (const r of a.requirements || []) if (!requiredIds.includes(r.id)) requiredIds.push(r.id);
+  const locked = lockedTests(sc);
   const er = validateReport(report, n, rubric, requiredIds);
+  if (!er.length) er.push(...validateTestIds(report.requirements, sc.gate_results, locked));
   if (er.length) fail('[GAUNTLET] FAIL critic_report invalid (invalid report): ' + er.join('; '));
 
   const score = Object.keys(rubric.criteria).reduce((a, k) => a + report.scores[k], 0);
-  /** @type {Requirement[]} */
-  const requirements = report.requirements.map((/** @type {Requirement} */ r) => ({ id: r.id, status: r.status, method: r.method, evidence: r.evidence }));
-  const unproven = unprovenRequirements(requirements);
+  // Proof comes from the gate's junit report where one exists; the critic's word only for run/browser.
+  const requirements = resolveProof(report.requirements, sc.gate_results, locked);
+  const unproven = requirements.filter((r) => !r.proven);
   // A requirement that is not proven is a blocker, so the next builder attacks it and approval is impossible.
   const blockers = [...report.blockers, ...unproven.map((r) => `${r.id} not proven (${r.status}, ${r.method}): ${r.evidence}`)];
   // Harness files (.claude/) never ride along with an iteration commit; rollback excludes them too.
@@ -791,6 +1166,7 @@ export function cmdRecordVerdict() {
   if (score > sc.best.score) sc.best = { iteration: n, score, sha };
   sc.gate_attempts_current = 0;
   sc.gate_tree = null;
+  sc.gate_results = null;
 
   const dest = path.join(P.history, `iter-${n}`);
   fs.mkdirSync(dest, { recursive: true });
@@ -843,20 +1219,25 @@ export function cmdClose() {
 export function cmdStatus() {
   const sc = loadScorecard();
   if (!sc) return 'loop_state: idle (no scorecard)';
-  const next = sc.loop_state === 'running'
-    ? `next: run builder for iteration ${sc.iteration + 1}`
-    : 'next: present report with the evidence of every requirement; then rollback-to-best (if applicable) or close';
+  const pending = sc.loop_state === 'running' && sc.acceptance && sc.acceptance.state === 'pending';
+  const next = pending
+    ? 'next: dispatch gauntlet:spec-tester, then run lock-acceptance'
+    : sc.loop_state === 'running'
+      ? `next: run builder for iteration ${sc.iteration + 1}`
+      : 'next: present report with the evidence of every requirement; then rollback-to-best (if applicable) or close';
   const last = sc.attempts.length ? sc.attempts[sc.attempts.length - 1] : null;
   const ids = [...(sc.requirement_ids || [])];
   for (const a of sc.attempts) for (const r of a.requirements || []) if (!ids.includes(r.id)) ids.push(r.id);
   /** @type {string[]} */
   const evidence = [`required ids: ${ids.length ? ids.join(', ') : 'none numbered; the critic lists every requirement'}`];
+  evidence.push(acceptanceLine(sc.acceptance));
   if (last && last.requirements) {
     const proven = last.requirements.length - (last.unproven || []).length;
     evidence.push(`requirements (iter ${last.iteration}): ${proven}/${last.requirements.length} proven`);
     for (const r of last.requirements) {
       const mark = (last.unproven || []).includes(r.id) ? 'NOT PROVEN' : 'proven';
-      evidence.push(`  ${r.id} [${mark}] ${r.status}/${r.method}: ${r.evidence.replace(/\s+/g, ' ').slice(0, 240)}`);
+      const by = r.source ? ` by ${r.source}` : '';
+      evidence.push(`  ${r.id} [${mark}${by}] ${r.status}/${r.method}: ${r.evidence.replace(/\s+/g, ' ').slice(0, 240)}`);
     }
   } else if (last) {
     evidence.push('requirements: none recorded (iteration scored before the evidence rule); nothing is proven');
@@ -874,24 +1255,61 @@ export function cmdStatus() {
 }
 
 /**
+ * One status line about the acceptance phase. The orchestrator passes it to the critic, so it lists
+ * which requirements a locked test decides and which the critic must prove itself.
+ * @param {Acceptance | undefined} a
+ * @returns {string}
+ */
+function acceptanceLine(a) {
+  if (!a) return 'acceptance: not part of this loop';
+  if (a.state !== 'locked') return `acceptance: ${a.state}${a.reason ? ` (${a.reason})` : ''}`;
+  const tests = Object.entries(a.tests || {}).map(([id, c]) => `${id} -> ${c.join(' + ')}`);
+  const nt = Object.keys(a.not_testable || {});
+  return `acceptance: locked at ${(a.sha || '').slice(0, 10)}; gate-proven by locked tests: ${tests.join('; ')}`
+    + (nt.length ? `; critic must prove (no automated test): ${nt.join(', ')}` : '');
+}
+
+/**
  * CLI dispatcher.
  * @param {string[]} argv arguments after the script path
  * @returns {string} output message
  * @throws {CliError} on usage errors and refusals
  */
+/** Folder that contains this plugin (the parent of scripts/). @type {string} */
+const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * Refuses to run from the plugin's own folder or from a folder without a harness. Without this, an agent
+ * started in the wrong directory reads "idle" and writes state where the hooks never look.
+ * @returns {void}
+ * @throws {CliError} when ROOT is the plugin folder or lacks `.claude/harness/discovery.json`
+ */
+export function assertProjectRoot() {
+  const rel = path.relative(PLUGIN_ROOT, ROOT);
+  /** @type {boolean} ROOT equals or sits inside PLUGIN_ROOT */
+  const insidePlugin = rel === '' || (rel.split(path.sep)[0] !== '..' && !path.isAbsolute(rel));
+  if (insidePlugin) fail(`[GAUNTLET] FAIL run from the project root, not the plugin folder (resolved: ${ROOT})`);
+  if (!fs.existsSync(P.config)) {
+    fail(`[GAUNTLET] FAIL no harness in ${ROOT} (missing .claude/harness/discovery.json); run /gauntlet:init in the project root`);
+  }
+}
+
 export function main(argv) {
   const [cmd, ...rest] = argv;
+  assertProjectRoot();
   const ri = rest.indexOf('--rubric');
   const rubricArg = ri >= 0 ? rest[ri + 1] : null;
   const pos = ri >= 0 ? rest.filter((_, i) => i !== ri && i !== ri + 1) : rest;
   switch (cmd) {
     case 'init': return cmdInit(pos[0], pos[1], rubricArg);
+    case 'lock-acceptance': return cmdLockAcceptance();
+    case 'skip-acceptance': return cmdSkipAcceptance(pos.join(' '));
     case 'next-iteration': return cmdNextIteration();
     case 'record-verdict': return cmdRecordVerdict();
     case 'rollback-to-best': return cmdRollback();
     case 'close': return cmdClose();
     case 'status': return cmdStatus();
-    default: fail('usage: gauntlet-cli <init|next-iteration|record-verdict|rollback-to-best|close|status>');
+    default: fail('usage: gauntlet-cli <init|lock-acceptance|skip-acceptance|next-iteration|record-verdict|rollback-to-best|close|status>');
   }
 }
 

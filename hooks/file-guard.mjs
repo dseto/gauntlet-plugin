@@ -2,7 +2,8 @@
 /**
  * PreToolUse hook (matcher: Edit|Write|MultiEdit|NotebookEdit) - blocks writes to protected paths.
  *
- * Protected: secret files, frozen quality configs, `.claude/**`, `.gauntlet/**` except `.gauntlet/inbox/**`.
+ * Protected: secret files, frozen quality configs, `.claude/**`, `.gauntlet/**` except `.gauntlet/inbox/**`,
+ * and the acceptance tests locked by a running loop.
  * Paths outside the project (scratchpad, user memory) are intentionally not handled here.
  * Best-effort guardrail, not a sandbox. Fail-closed: malformed input blocks (exit 2).
  */
@@ -14,6 +15,7 @@ const REASONS = Object.freeze({
   protected: 'quality/config file frozen by the harness (use HARNESS_OFF=1 for a legitimate change)',
   claude: 'harness files under .claude/',
   gauntlet: 'gauntlet state; agents may only write .gauntlet/inbox/',
+  acceptance: 'acceptance test locked by the Gauntlet loop; change the code so the test passes, not the test',
 });
 
 /**
