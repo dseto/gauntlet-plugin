@@ -27,4 +27,16 @@ You are the builder of a Gauntlet Loop iteration. The orchestrator tells you the
 }
 ```
 
+Spec conflict: if two locked acceptance tests (or a locked test and the reference) cannot both be true, no implementation can pass them all. Do not bend the code to fit one of them, and do not touch the tests. Instead write `.gauntlet/inbox/spec_conflict.json` and finish:
+
+```json
+{
+  "schema_version": 1,
+  "iteration": N,
+  "conflicts": [{ "tests": ["R1", "R2"], "reason": "why the two cannot hold together, at least 40 characters" }]
+}
+```
+
+`tests` lists requirement ids or locked test names involved. The stop gate then halts the loop as `HALTED_SPEC_CONFLICT` and the user must fix the spec. Use it only for a real contradiction, not for a test you find hard to pass.
+
 When you try to finish, a stop gate runs the reference and acceptance locks, anti-cheat, build and tests. Locked acceptance tests that still fail do not fail the gate, but their requirement stays unproven and the loop cannot be approved. If the gate fails, read the `[HARNESS] FAIL` message and fix the cause. If the gate fails 3 times the loop stops; do not try to bypass the gate. Messages starting with `[HARNESS]` are intentional: never work around them.

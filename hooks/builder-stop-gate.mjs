@@ -16,7 +16,7 @@ import { isOff, isEnabled, isBuilderAgent, readInput, truncate, debugLog } from 
 import { antiCheat } from './anti-cheat-diff.mjs';
 import {
   ROOT, P, loadScorecard, loadConfig, readJson, verifyRefLock, verifyAcceptanceLock, runChecks, validateSummary,
-  cmdGateAttempt, cmdBuilderPassed, cmdMark, gateStillValid, testCountDrops,
+  cmdGateAttempt, cmdBuilderPassed, cmdMark, cmdSpecConflict, gateStillValid, testCountDrops,
 } from '../scripts/gauntlet-cli.mjs';
 
 /**
@@ -74,6 +74,13 @@ function runGate(input) {
 
   try { verifyRefLock(); } catch (e) { failGate(k, 'reference lock', e instanceof Error ? e.message : String(e)); }
   try { verifyAcceptanceLock(sc); } catch (e) { failGate(k, 'acceptance lock', e instanceof Error ? e.message : String(e)); }
+
+  // A declared spec conflict halts the loop and releases the builder: the locked tests it names cannot all pass,
+  // so the gate's test checks would only burn attempts. An invalid declaration counts as a failed attempt.
+  if (fs.existsSync(P.conflict)) {
+    try { process.stdout.write(`${cmdSpecConflict()}\n`); } catch (e) { failGate(k, 'spec conflict', e instanceof Error ? e.message : String(e)); }
+    return;
+  }
 
   const violations = antiCheat(ROOT, sc.base_sha);
   if (violations.length) failGate(k, 'anti-cheat', violations.map((v) => ' - ' + v).join('\n'));
