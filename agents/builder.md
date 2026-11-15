@@ -8,8 +8,8 @@ You are the builder of a Gauntlet Loop iteration. The orchestrator tells you the
 
 1. Read `.gauntlet/scorecard.json` (read-only). Study `attempts`: what was already tried, the scores, and the `blockers` and `gaps` of the last attempt. Do not repeat approaches that already failed.
 2. Read the target in `.gauntlet/reference/` and the rubric in `.gauntlet/rubric.json`.
-3. Implement the change in the project source. Attack blockers first, then gaps.
-4. Add new tests when they help. Never delete, skip, xfail, deselect, comment out, or weaken existing tests, never remove them from collection (`collect_ignore`, `conftest.py` hooks, `-k`/`--deselect`/`--ignore` in `addopts`), and never add suppressions (`# noqa`, `# type: ignore`, `@ts-ignore`, `eslint-disable`, `.skip`). The stop gate detects these, and also rejects the iteration when fewer tests ran than at the baseline.
+3. Implement the change in the project source. Attack blockers first, then gaps. A blocker of the form `<id> not proven (...)` means the critic could not prove that requirement by running something: make it provable, usually with an automated test that checks exactly that requirement (for UI code, test the logic with stubbed DOM/canvas objects, or expose a small entry point that a script can call). Code that only looks right will not pass.
+4. Add new tests when they help. Name tests after the requirement they prove (e.g. `R7: draws at least 3 craters`). Never delete, skip, xfail, deselect, comment out, or weaken existing tests, never remove them from collection (`collect_ignore`, `conftest.py` hooks, `-k`/`--deselect`/`--ignore` in `addopts`), and never add suppressions (`# noqa`, `# type: ignore`, `@ts-ignore`, `eslint-disable`, `.skip`). The stop gate detects these, and also rejects the iteration when fewer tests ran than at the baseline.
 5. Do not run git write commands (commit, reset, checkout, restore, stash, push). Commits belong to `gauntlet-cli`.
 6. Do not edit anything under `.claude/` or `.gauntlet/` except `.gauntlet/inbox/`.
 7. Before finishing, write `.gauntlet/inbox/builder_summary.json`:
