@@ -7,7 +7,7 @@
  *
  * Subcommands: init, lock-acceptance, skip-acceptance, next-iteration, record-verdict, rollback-to-best,
  * close, status.
- * The gate transitions (cmdGateAttempt, cmdBuilderPassed, cmdMark) are exported for the stop gate hook
+ * The gate transitions (cmdGateAttempt, cmdGateFailed, cmdBuilderPassed, cmdMark) are exported for the stop gate hook
  * only and are deliberately not reachable from the command line.
  *
  * Proof of a requirement, strongest first:
@@ -84,6 +84,7 @@
  * @property {string[]} [requirement_ids] numbered requirements found in the reference at init; every report must cover them
  * @property {Acceptance} [acceptance] acceptance-test phase (absent in loops started before it existed)
  * @property {Record<string, Outcome> | null} [gate_results] junit outcomes of the gate run, by `command::classname::name`
+ * @property {{ attempt: number, check: string, log: string }} [last_gate_failure] why the last gate attempt failed (cleared when the gate passes)
  */
 /**
  * @typedef {object} CheckCommand
@@ -1073,8 +1074,27 @@ export function cmdBuilderPassed(results) {
   sc.gate_tree = worktreeTreeHash();
   sc.gate_results = results && Object.keys(results).length ? results : null;
   sc.gate_attempts_current = 0;
+  delete sc.last_gate_failure;
   save(sc);
   return `[GAUNTLET] gate passed for iteration ${sc.gate_passed_iteration}`;
+}
+
+/**
+ * Records why the current gate attempt failed, so the orchestrator and the next builder can read it from the
+ * scorecard (the hook's stderr does not always reach them). The last allowed attempt ends the loop as
+ * GATE_FAILED at once, instead of one stop later. No-op when nothing is running.
+ * @param {string} check name of the failed check
+ * @param {string} log details (cut to 2000 chars)
+ * @returns {string} message
+ */
+export function cmdGateFailed(check, log) {
+  const sc = loadScorecard();
+  if (!sc || sc.loop_state !== 'running') return '[GAUNTLET] no running loop; gate failure not recorded';
+  const attempt = Number.isFinite(sc.gate_attempts_current) ? sc.gate_attempts_current : 0;
+  sc.last_gate_failure = { attempt, check: String(check).slice(0, 80), log: String(log == null ? '' : log).slice(0, 2000) };
+  if (attempt >= sc.gate_max_attempts) terminal(sc, 'GATE_FAILED', `builder failed the gate ${sc.gate_max_attempts} times; last failure: ${check}`);
+  save(sc);
+  return `[GAUNTLET] gate attempt ${attempt}/${sc.gate_max_attempts} failed: ${check}`;
 }
 
 /**
@@ -1111,13 +1131,17 @@ export function cmdSpecConflict() {
   }
   if (!Array.isArray(d.conflicts) || d.conflicts.length === 0) fail('[GAUNTLET] FAIL spec_conflict.json needs at least one conflict');
   const locked = sc.acceptance.tests || {};
-  const known = new Set([...Object.keys(locked), ...Object.values(locked).flat()]);
+  // Locked test ids as a results-like map, so matchTests accepts the full id, a classname::name suffix or the bare name.
+  const lockedIds = Object.fromEntries(Object.values(locked).flat().map((id) => [id, /** @type {Outcome} */ ('pass')]));
   for (const c of d.conflicts) {
     if (!c || typeof c !== 'object' || !Array.isArray(c.tests) || c.tests.length === 0) {
       fail('[GAUNTLET] FAIL each conflict must list the locked tests or requirement ids it involves ("tests": [...])');
     }
-    const unknown = c.tests.filter((t) => typeof t !== 'string' || !known.has(t));
-    if (unknown.length) fail(`[GAUNTLET] FAIL conflict names something that is not a locked test or requirement: ${unknown.join(', ')}`);
+    const unknown = c.tests.filter((t) => typeof t !== 'string' || !(Object.hasOwn(locked, t) || matchTests(lockedIds, t).length));
+    if (unknown.length) {
+      fail(`[GAUNTLET] FAIL conflict names something that is not a locked test or requirement: ${unknown.join(', ')}. `
+        + 'Accepted: a requirement id (R1), a test name (test_r1_x), a classname::name suffix or the full junit id (as in status "gate-proven by locked tests")');
+    }
     if (typeof c.reason !== 'string' || c.reason.trim().length < 40) {
       fail('[GAUNTLET] FAIL each conflict needs a reason of at least 40 characters explaining the contradiction');
     }
@@ -1125,8 +1149,8 @@ export function cmdSpecConflict() {
   const summary = d.conflicts.map((c) => c.tests.join(' + ')).join('; ');
   terminal(sc, 'HALTED_SPEC_CONFLICT', `spec conflict: ${summary}`); save(sc);
   const lines = d.conflicts.map((c) => ` - ${c.tests.join(' + ')}: ${String(c.reason).replace(/[^\x20-\x7e]/g, '?')}`);
-  return ['[GAUNTLET] status HALTED_SPEC_CONFLICT: the locked acceptance tests cannot all pass', ...lines,
-    'next: the spec needs a fix by the user; then close and init again with a new component name'].join('\n');
+  return ['[GAUNTLET] status HALTED_SPEC_CONFLICT: the locked acceptance tests cannot all pass (the fix may be in a locked test or in the reference)', ...lines,
+    'next: the spec or a locked test needs a fix by the user; then close and init again with a new component name'].join('\n');
 }
 
 /**
@@ -1207,6 +1231,7 @@ export function cmdRecordVerdict() {
   sc.gate_attempts_current = 0;
   sc.gate_tree = null;
   sc.gate_results = null;
+  delete sc.last_gate_failure;
 
   const dest = path.join(P.history, `iter-${n}`);
   fs.mkdirSync(dest, { recursive: true });
@@ -1260,10 +1285,12 @@ export function cmdStatus() {
   const sc = loadScorecard();
   if (!sc) return 'loop_state: idle (no scorecard)';
   const pending = sc.loop_state === 'running' && sc.acceptance && sc.acceptance.state === 'pending';
+  // Only while this iteration's gate has not passed: a stale record must not send the orchestrator back to the builder.
+  const gf = sc.loop_state === 'running' && sc.gate_passed_iteration !== sc.iteration + 1 ? sc.last_gate_failure : undefined;
   const next = pending
     ? 'next: dispatch gauntlet:spec-tester, then run lock-acceptance'
     : sc.loop_state === 'running'
-      ? `next: run builder for iteration ${sc.iteration + 1}`
+      ? (gf ? `next: re-dispatch builder for iteration ${sc.iteration + 1} with the gate failure above` : `next: run builder for iteration ${sc.iteration + 1}`)
       : 'next: present report with the evidence of every requirement; then rollback-to-best (if applicable) or close';
   const last = sc.attempts.length ? sc.attempts[sc.attempts.length - 1] : null;
   const ids = [...(sc.requirement_ids || [])];
@@ -1288,6 +1315,7 @@ export function cmdStatus() {
     `iteration: ${sc.iteration}/${sc.max_iterations}  threshold: ${sc.pass_threshold}  gate attempts: ${sc.gate_attempts_current}/${sc.gate_max_attempts}`,
     `scores: [${sc.score_history.join(', ')}]  best: ${sc.best.iteration === null ? 'none' : `iter ${sc.best.iteration} = ${sc.best.score}`}`,
     ...(sc.attempts.length ? [`last blockers: ${JSON.stringify(sc.attempts[sc.attempts.length - 1].blockers)}`, `last gaps: ${JSON.stringify(sc.attempts[sc.attempts.length - 1].gaps)}`] : []),
+    ...(gf ? [`last gate failure (attempt ${gf.attempt}/${sc.gate_max_attempts}): ${gf.check}: ${gf.log.replace(/\s+/g, ' ').trim().slice(0, 600)}`] : []),
     ...evidence,
     ...(sc.warnings && sc.warnings.length ? [`warnings: ${sc.warnings.join('; ')}`] : []),
     next,

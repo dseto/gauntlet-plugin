@@ -6,7 +6,8 @@
  * the baseline, and fewer executed tests than the baseline), builder_summary.json. On success the checked
  * working tree is pinned by hash and the junit outcomes are stored for record-verdict. Locked acceptance
  * tests that still fail do not fail the gate (they are baseline failures); they leave their requirement
- * unproven at the verdict. exit 2 keeps the builder working, bounded by gate_max_attempts.
+ * unproven at the verdict. exit 2 keeps the builder working, bounded by gate_max_attempts. Every failure is also
+ * stored in the scorecard (last_gate_failure); the last allowed attempt marks GATE_FAILED and exits 0.
  * Infra problems (timeouts, missing executables) mark HALTED_INFRA instead of blaming the builder.
  * Unlike the guards, a crash here exits 0 (fail-closed would trap the builder in a loop); safety
  * comes from record-verdict refusing any iteration whose gate did not pass.
@@ -16,7 +17,7 @@ import { isOff, isEnabled, isBuilderAgent, readInput, truncate, debugLog } from 
 import { antiCheat } from './anti-cheat-diff.mjs';
 import {
   ROOT, P, loadScorecard, loadConfig, readJson, verifyRefLock, verifyAcceptanceLock, runChecks, validateSummary,
-  cmdGateAttempt, cmdBuilderPassed, cmdMark, cmdSpecConflict, gateStillValid, testCountDrops,
+  cmdGateAttempt, cmdGateFailed, cmdBuilderPassed, cmdMark, cmdSpecConflict, gateStillValid, testCountDrops,
 } from '../scripts/gauntlet-cli.mjs';
 
 /**
@@ -31,15 +32,26 @@ function infra(msg) {
 }
 
 /**
- * Fails this gate attempt: the builder keeps working.
+ * Fails this gate attempt: records the reason in the scorecard and keeps the builder working (exit 2),
+ * or releases it (exit 0) when that failure ended the loop as GATE_FAILED.
  * @param {string} attempt "k/max"
  * @param {string} check failed check name
  * @param {string} log details
  * @returns {never}
  */
 function failGate(attempt, check, log) {
+  // The scorecard is the channel to the orchestrator and the next builder; stderr may never reach them.
+  let ended = false;
+  try {
+    cmdGateFailed(check, log);
+    const sc = loadScorecard();
+    ended = !sc || sc.loop_state !== 'running';
+  } catch (e) {
+    // Best-effort: the attempt counter still bounds the retries, but say why the reason was not stored.
+    process.stderr.write(`[HARNESS] WARN gate failure not recorded: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
   process.stderr.write(`[HARNESS] FAIL gate attempt ${attempt}: ${check}:\n${truncate(log)}\n`);
-  process.exit(2);
+  process.exit(ended ? 0 : 2);
 }
 
 /**

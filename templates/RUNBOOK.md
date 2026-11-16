@@ -103,9 +103,9 @@ Use só quando houver uma tarefa com **referência concreta**: spec, mockup, sa�
 | `APPROVED` | score >= 85, nenhum blocker e todos os requisitos comprovados por execução (`test`, `run` ou `browser`) |
 | `HALTED_MAX_ITER` | 6 iterações sem aprovação |
 | `HALTED_PLATEAU` | a melhor nota não subiu pelo menos 6 pontos nas últimas 3 iterações (só avaliado a partir da 4ª) |
-| `GATE_FAILED` | o builder falhou no stop gate 3 vezes seguidas |
+| `GATE_FAILED` | o builder falhou no stop gate 3 vezes seguidas; a 3a falha encerra o loop na mesma parada |
 | `HALTED_INFRA` | timeout ou erro de infraestrutura (não é culpa do builder) |
-| `HALTED_SPEC_CONFLICT` | o builder declarou, em `.gauntlet/inbox/spec_conflict.json`, que testes de aceitação travados se contradizem (ou contradizem a referência). O loop para; a spec precisa ser corrigida pelo usuário. Para recomeçar: `close` e um novo `init` com outro nome de componente, depois de corrigir a referência |
+| `HALTED_SPEC_CONFLICT` | o builder declarou, em `.gauntlet/inbox/spec_conflict.json`, que testes de aceitação travados se contradizem (ou contradizem a referência). O loop para; o conserto pode estar na referência ou em um teste travado, e quem corrige é o usuário. Para recomeçar: `close` e um novo `init` com outro nome de componente, depois de corrigir |
 
 ### Prova por requisito
 
@@ -116,5 +116,7 @@ Ordem de força da prova:
 1. **Teste de aceitação travado** que passou no junit do gate. Decide o requisito; o critic só derruba com um `unmet` observado.
 2. **`test_id` do critic** que passou no junit do gate. Se o gate tem junit, `met` por `test` sem `test_id`, ou com um teste que não rodou, é recusado; um teste que falhou deixa o requisito sem prova.
 3. **`run`/`browser`** do critic (ou `test` quando nenhum comando gera junit). Cada requisito não comprovado vira blocker `<id> not proven (...)`, então o loop continua iterando e não aprova. IDs numerados da referência (R1, AC-2, FR-3.1...) são extraídos no `init`; um relatório que omita algum, ou que retire um id listado numa iteração anterior, é recusado. `status` mostra a evidência de cada requisito da última iteração.
+
+Uma falha do stop gate fica gravada no scorecard (`last_gate_failure`, com a tentativa, o check e o log; o `status` mostra a linha `last gate failure`) e o orquestrador repassa o motivo ao builder. A falha é apagada quando o gate passa. A 3a falha seguida encerra o loop como `GATE_FAILED` na hora.
 
 Qualquer status diferente de `IN_PROGRESS` deixa o loop em `terminal`: o circuit breaker bloqueia novos builders até um `close`. Com `acceptance: pending`, o circuit breaker também bloqueia o builder até `lock-acceptance` ou `skip-acceptance`.
