@@ -651,7 +651,8 @@ test('gate failure: reason is stored, shown by status and cleared when the gate 
     assert.equal(scorecard(dir).last_gate_failure, undefined, 'a passing gate clears the failure');
     const after = cli(dir, 'status').out;
     assert.doesNotMatch(after, /last gate failure/);
-    assert.match(after, /next: run builder for iteration 1/);
+    assert.match(after, /gate: passed for iteration 1 \(attempts used: 2\/3\)/);
+    assert.match(after, /next: dispatch gauntlet:critic for iteration 1, then record-verdict/);
 
     // A stale record (the gate already passed for this iteration) is not shown, and record-verdict drops it.
     const f2 = path.join(dir, '.gauntlet', 'scorecard.json');
@@ -698,9 +699,11 @@ test('bash-guard: the inbox folder itself is writable', () => {
       const r = guard(c);
       assert.equal(r.code, 0, `${c}: ${r.out}`);
     }
-    // Only creating the folder is allowed: moving, copying or deleting it, or walking out of it, is not.
+    // Copying out of the inbox only reads it (the source is not a write target), so it is allowed.
+    assert.equal(guard('cp -r .gauntlet/inbox ../gone').code, 0);
+    // Only creating the folder is allowed: moving or deleting it, writing into it, or walking out of it, is not.
     for (const c of ['mkdir .gauntlet/other', 'rm -rf .gauntlet', 'mv .gauntlet/inbox ../gone', 'mv x .gauntlet/inbox',
-      'cp -r .gauntlet/inbox ../gone', 'mkdir -p .gauntlet/inbox/..']) {
+      'cp x .gauntlet/inbox', 'mkdir -p .gauntlet/inbox/..']) {
       const r = guard(c);
       assert.equal(r.code, 2, `${c}: ${r.out}`);
     }

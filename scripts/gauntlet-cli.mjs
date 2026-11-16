@@ -25,7 +25,8 @@
  * @property {number} score
  * @property {Record<string, number>} breakdown
  * @property {string[]} blockers critic blockers plus one per requirement that is not proven
- * @property {string[]} gaps
+ * @property {unknown[]} gaps strings, or objects {text, kind?: 'defect'|'improvement'}
+ * @property {string[]} [open_defects] defect gaps left open when the last iteration was approved
  * @property {Requirement[]} [requirements] per-requirement verdict of the critic
  * @property {string[]} [unproven] ids of requirements that are not met with executed evidence
  */
@@ -74,6 +75,7 @@
  * @property {Record<string, TestCounts>} [baseline_counts] per test command, from the junit report at init
  * @property {number} [plateau_window] iterations the best score may stay flat (default 3)
  * @property {number | null} gate_passed_iteration
+ * @property {number | null} [gate_passed_attempts] gate attempts used by the run that passed (for status)
  * @property {string | null} builder_summary_sha256
  * @property {string | null} [gate_tree] git tree hash of the working tree that passed the gate
  * @property {{ iteration: number | null, score: number, sha: string | null }} best
@@ -725,6 +727,22 @@ export function validateSummary(s, iteration) {
   for (const k of ['changed_files', 'tests_added', 'remaining_risks']) if (!s || !Array.isArray(s[k])) e.push(`${k} must be an array`);
   return e;
 }
+/** Allowed values of the optional `kind` of a gap; absent means improvement. */
+const GAP_KINDS = ['defect', 'improvement'];
+/** @param {any} g @returns {string} text of a gap (string or object) */
+function gapText(g) {
+  if (typeof g === 'string') return g;
+  if (g && typeof g === 'object') return String(g.text || g.description || g.gap || JSON.stringify(g));
+  return String(g);
+}
+/**
+ * Defect gaps (crash, wrong output, contract deviation) of a validated report.
+ * @param {unknown[]} gaps
+ * @returns {string[]} their texts
+ */
+export function defectGaps(gaps) {
+  return (gaps || []).filter((/** @type {any} */ g) => g && typeof g === 'object' && g.kind === 'defect').map(gapText);
+}
 /**
  * Validates critic_report.json: schema v1, iteration, scores keys/ranges per rubric, lists, requirements.
  * @param {any} r parsed report
@@ -747,6 +765,11 @@ export function validateReport(r, iteration, rubric, requiredIds) {
   }
   if (!r || !Array.isArray(r.blockers)) e.push('blockers must be an array');
   if (!r || !Array.isArray(r.gaps) || r.gaps.length > 3) e.push('gaps must be an array with at most 3 items');
+  else r.gaps.forEach((/** @type {any} */ g, /** @type {number} */ i) => {
+    if (g && typeof g === 'object' && g.kind !== undefined && !GAP_KINDS.includes(g.kind)) {
+      e.push(`gaps[${i}].kind must be one of: ${GAP_KINDS.join(', ')} (got ${JSON.stringify(g.kind)})`);
+    }
+  });
   if (!r || !Array.isArray(r.evidence) || r.evidence.length === 0) e.push('evidence must be a non-empty array');
   e.push(...validateRequirements(r ? r.requirements : undefined, requiredIds));
   return e;
@@ -1073,6 +1096,7 @@ export function cmdBuilderPassed(results) {
   sc.builder_summary_sha256 = sha256File(P.summary);
   sc.gate_tree = worktreeTreeHash();
   sc.gate_results = results && Object.keys(results).length ? results : null;
+  sc.gate_passed_attempts = sc.gate_attempts_current;
   sc.gate_attempts_current = 0;
   delete sc.last_gate_failure;
   save(sc);
@@ -1215,7 +1239,15 @@ export function cmdRecordVerdict() {
   const requirements = resolveProof(report.requirements, sc.gate_results, locked);
   const unproven = requirements.filter((r) => !r.proven);
   // A requirement that is not proven is a blocker, so the next builder attacks it and approval is impossible.
-  const blockers = [...report.blockers, ...unproven.map((r) => `${r.id} not proven (${r.status}, ${r.method}): ${r.evidence}`)];
+  // Defect gaps block approval while iterations remain (the next builder gets them like blockers);
+  // on the last iteration they cannot be fixed anymore, so they are reported as open defects instead.
+  const defects = defectGaps(report.gaps);
+  const lastIteration = n >= sc.max_iterations;
+  const blockers = [
+    ...report.blockers,
+    ...unproven.map((r) => `${r.id} not proven (${r.status}, ${r.method}): ${r.evidence}`),
+    ...(lastIteration ? [] : defects.map((d) => `defect: ${d}`)),
+  ];
   // Harness files (.claude/) never ride along with an iteration commit; rollback excludes them too.
   git(['add', '-A', '--', ...COMMIT_SPEC]);
   git(['commit', '--allow-empty', '--no-verify', '-m', `gauntlet: iter ${n} score ${score}`]);
@@ -1225,10 +1257,12 @@ export function cmdRecordVerdict() {
   sc.attempts.push({
     iteration: n, sha, builder_summary: summary.summary, score, breakdown: report.scores, blockers, gaps: report.gaps,
     requirements, unproven: unproven.map((r) => r.id),
+    ...(lastIteration && defects.length ? { open_defects: defects } : {}),
   });
   sc.score_history.push(score);
   if (score > sc.best.score) sc.best = { iteration: n, score, sha };
   sc.gate_attempts_current = 0;
+  sc.gate_passed_attempts = null;
   sc.gate_tree = null;
   sc.gate_results = null;
   delete sc.last_gate_failure;
@@ -1240,11 +1274,13 @@ export function cmdRecordVerdict() {
   fs.mkdirSync(P.inbox, { recursive: true });
 
   const unprovenNote = unproven.length ? `${unproven.length} requirement(s) not proven: ${unproven.map((r) => r.id).join(', ')}` : '';
-  if (score >= sc.pass_threshold && blockers.length === 0) terminal(sc, 'APPROVED');
+  const defectNote = lastIteration && defects.length ? `approved with ${defects.length} open defects: ${defects.join('; ')}` : '';
+  if (score >= sc.pass_threshold && blockers.length === 0) terminal(sc, 'APPROVED', defectNote || undefined);
   else if (sc.iteration >= sc.max_iterations) terminal(sc, 'HALTED_MAX_ITER', unprovenNote || undefined);
   else if (isPlateau(sc.score_history, sc.plateau_epsilon, sc.plateau_window || 3)) terminal(sc, 'HALTED_PLATEAU', unprovenNote || undefined);
   save(sc);
-  return `[GAUNTLET] iteration ${n} score ${score} -> ${sc.status}` + (unprovenNote ? ` (${unprovenNote})` : ` (all ${requirements.length} requirements proven)`);
+  return `[GAUNTLET] iteration ${n} score ${score} -> ${sc.status}` + (unprovenNote ? ` (${unprovenNote})` : ` (all ${requirements.length} requirements proven)`)
+    + (sc.status === 'APPROVED' && defectNote ? ` (${defectNote})` : '');
 }
 
 /**
@@ -1286,11 +1322,12 @@ export function cmdStatus() {
   if (!sc) return 'loop_state: idle (no scorecard)';
   const pending = sc.loop_state === 'running' && sc.acceptance && sc.acceptance.state === 'pending';
   // Only while this iteration's gate has not passed: a stale record must not send the orchestrator back to the builder.
-  const gf = sc.loop_state === 'running' && sc.gate_passed_iteration !== sc.iteration + 1 ? sc.last_gate_failure : undefined;
+  const gatePassed = sc.loop_state === 'running' && sc.gate_passed_iteration === sc.iteration + 1;
+  const gf = sc.loop_state === 'running' && !gatePassed ? sc.last_gate_failure : undefined;
   const next = pending
     ? 'next: dispatch gauntlet:spec-tester, then run lock-acceptance'
     : sc.loop_state === 'running'
-      ? (gf ? `next: re-dispatch builder for iteration ${sc.iteration + 1} with the gate failure above` : `next: run builder for iteration ${sc.iteration + 1}`)
+      ? (gatePassed ? `next: dispatch gauntlet:critic for iteration ${sc.iteration + 1}, then record-verdict` : gf ? `next: re-dispatch builder for iteration ${sc.iteration + 1} with the gate failure above` : `next: run builder for iteration ${sc.iteration + 1}`)
       : 'next: present report with the evidence of every requirement; then rollback-to-best (if applicable) or close';
   const last = sc.attempts.length ? sc.attempts[sc.attempts.length - 1] : null;
   const ids = [...(sc.requirement_ids || [])];
@@ -1313,6 +1350,7 @@ export function cmdStatus() {
     `component: ${sc.component}  branch: ${sc.branch}`,
     `loop_state: ${sc.loop_state}  status: ${sc.status}${sc.halt_reason ? ` (${sc.halt_reason})` : ''}`,
     `iteration: ${sc.iteration}/${sc.max_iterations}  threshold: ${sc.pass_threshold}  gate attempts: ${sc.gate_attempts_current}/${sc.gate_max_attempts}`,
+    ...(gatePassed ? [`gate: passed for iteration ${sc.iteration + 1} (attempts used: ${sc.gate_passed_attempts || 0}/${sc.gate_max_attempts})`] : []),
     `scores: [${sc.score_history.join(', ')}]  best: ${sc.best.iteration === null ? 'none' : `iter ${sc.best.iteration} = ${sc.best.score}`}`,
     ...(sc.attempts.length ? [`last blockers: ${JSON.stringify(sc.attempts[sc.attempts.length - 1].blockers)}`, `last gaps: ${JSON.stringify(sc.attempts[sc.attempts.length - 1].gaps)}`] : []),
     ...(gf ? [`last gate failure (attempt ${gf.attempt}/${sc.gate_max_attempts}): ${gf.check}: ${gf.log.replace(/\s+/g, ' ').trim().slice(0, 600)}`] : []),
