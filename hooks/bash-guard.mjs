@@ -30,7 +30,14 @@ const BLOCKED_CLASSES = new Set(['protected', 'claude', 'gauntlet', 'secret', 'a
 function underAllowedOutside(token) {
   /** @param {string} p */
   const norm = (p) => path.resolve(p.replace(/^\/([a-zA-Z])\//, '$1:/')).toLowerCase();
-  const target = norm(token.replace(/^~/, os.homedir()));
+  let raw = token.replace(/^~/, os.homedir());
+  if (process.platform === 'win32' && raw.startsWith('/')) {
+    // Git Bash maps /tmp and /var/tmp to the OS temp dir. Normalize first so /tmp/../etc cannot escape.
+    const posix = path.posix.normalize(raw.replace(/\\/g, '/'));
+    const m = /^\/(?:var\/)?tmp(?:\/(.*))?$/i.exec(posix);
+    if (m) raw = path.join(os.tmpdir(), m[1] || '');
+  }
+  const target = norm(raw);
   const roots = [os.tmpdir(), process.env.TEMP, process.env.TMP, path.join(os.homedir(), '.claude')]
     .filter((r) => typeof r === 'string' && r.length > 0)
     .map((r) => norm(/** @type {string} */ (r)));
@@ -103,10 +110,50 @@ function checkTarget(raw, cfg, mkdirOnly = false) {
 function checkWrites(cmd, cfg) {
   for (const m of cmd.matchAll(REDIRECT_TARGET_RE)) checkTarget(m[1], cfg);
   for (const seg of cmd.split(/[;|&\n]+/)) {
-    if (!WRITE_VERB_RE.test(seg)) continue;
+    const vm = WRITE_VERB_RE.exec(seg);
+    if (!vm) continue;
     const mkdirOnly = /^\s*\(?mkdir\b/i.test(seg);
-    for (const t of tokens(seg.replace(REDIRECT_TARGET_RE, ' '))) checkTarget(t, cfg, mkdirOnly);
+    const toks = tokens(seg.replace(REDIRECT_TARGET_RE, ' '));
+    const verb = (vm[2] || '').toLowerCase();
+    for (const t of COPY_VERBS.has(verb) ? copyDestinations(toks, verb) : toks) checkTarget(t, cfg, mkdirOnly);
   }
+}
+
+const COPY_VERBS = new Set(['cp', 'copy', 'copy-item', 'xcopy', 'robocopy']);
+
+/**
+ * For copy verbs only the destination is a write target; sources are read-only.
+ * Handles `cp -t DIR`, `--target-directory[=]DIR`, `Copy-Item -Destination X`, else the last operand.
+ * @param {string[]} toks tokens of the segment (verb included)
+ * @param {string} verb lowercased copy verb
+ * @returns {string[]}
+ */
+function copyDestinations(toks, verb) {
+  const i = toks.findIndex((t) => t.toLowerCase() === verb);
+  const args = i >= 0 ? toks.slice(i + 1) : toks;
+  const out = [];
+  const operands = [];
+  const winFlag = /^(xcopy|robocopy)$/.test(verb);
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    const low = a.toLowerCase();
+    // Fail closed on short-flag clusters carrying t/T (-rt DIR, -vt DIR, -tDIR, -T): the destination
+    // position is ambiguous, so every operand stays a write target, as before the copy-source change.
+    if (verb === 'cp' && /^-[a-zA-Z]*[tT]/.test(a) && a !== '-t') {
+      // Also check an attached value (-tDIR): whatever follows the first t/T of the cluster.
+      const attached = a.replace(/^-[a-zA-Z]*?[tT]/, '');
+      return [...args.filter((x) => !/^-/.test(x)), ...(attached ? [attached] : [])];
+    }
+    if (a === '-t' || low === '--target-directory' || low === '-destination' || low === '-dest') {
+      if (k + 1 < args.length) out.push(args[++k]);
+    } else if (low.startsWith('--target-directory=')) {
+      out.push(a.slice('--target-directory='.length));
+    } else if (/^-/.test(a) || (winFlag && /^\/[a-z?]{1,3}(:.*)?$/i.test(a) && !/^\/(tmp|etc|usr|opt|var|bin)$/i.test(a))) {
+      continue;
+    } else operands.push(a);
+  }
+  if (out.length) return out;
+  return operands.length ? [operands[operands.length - 1]] : [];
 }
 
 runGuard('bash-guard', () => {
