@@ -7,10 +7,10 @@ Replaces `harness-kit/install.mjs` copies.
 
 A single Claude session that builds something and then judges its own work tends to declare victory early. The Gauntlet Loop splits the job and makes the stopping rule mechanical:
 
-- **Spec-tester** (`gauntlet:spec-tester`) runs once, before any implementation, and writes one acceptance test per numbered requirement of the reference. The CLI locks them only if they **fail** now (red), then commits and hash-locks them. The builder must make them pass and can never edit them.
+- **Spec-tester** (`gauntlet:spec-tester`) runs once, before any implementation, and writes one acceptance test per numbered requirement of the reference. The CLI locks them only if they **fail** now (red), except tests marked `preexisting`, which must pass; then it commits and hash-locks them. The builder must make them pass and can never edit them while the loop runs.
 - **Builder** (`gauntlet:builder`) implements one iteration toward a concrete reference and may not commit or touch `.gauntlet/` state.
-- **Stop gate** (a hook, not a prompt) runs when the builder finishes: reference lock, anti-cheat diff, build, tests. A builder that fails it three times in a row ends the loop as `GATE_FAILED`.
-- **Critic** (`gauntlet:critic`) scores the artifact against a rubric without reading the builder's own story, and lists blockers and gaps.
+- **Stop gate** (a hook, not a prompt) runs when the builder finishes: reference lock, anti-cheat diff, build, tests. After three failed attempts in a row, the next stop (the 4th) marks the loop `GATE_FAILED` without running the checks.
+- **Critic** (`gauntlet:critic`) scores the artifact against a rubric without reading the builder's own story (instructed, not technically enforced), and lists blockers and gaps.
 - **State machine CLI** decides what happens next: approve, iterate, or halt. The agents never decide that.
 
 Benefits:
@@ -19,14 +19,14 @@ Benefits:
 |---|---|
 | Fewer false "done" | Approval needs score >= 85, no blockers **and** every requirement proven by something that ran, from a separate critic. |
 | Proof, not opinion | The critic reports each requirement with `status`, `method` and `evidence`. Only `met` by `test`, `run` or `browser` counts; `static` (reading the code) does not. Every unproven requirement becomes a blocker, so the loop keeps iterating. Numbered ids in the reference (R1, AC-2, ...) must all be reported. |
-| Tests the builder cannot bend | With numbered requirements and a junit test command, acceptance tests are written from the reference before any code, must be red when locked, and are hash-locked (hooks block edits, the gate fails on any byte change). A requirement with a locked test is proven only when that test passes in the gate's junit report; the critic can still veto it with an observed `unmet`. |
+| Tests the builder cannot bend | With numbered requirements and a junit test command, acceptance tests are written from the reference before any code, must be red when locked (green if marked `preexisting`), and are hash-locked (hooks block edits, the gate fails on any byte change). A requirement with a locked test is proven only when that test passes in the gate's junit report; the critic can still veto it with an observed `unmet`. |
 | Test claims are checked | When the gate has a junit report, a critic `met` by `test` must name the test (`test_id`). The CLI looks it up in the report of the gate run: an unknown test is rejected, a failing one leaves the requirement unproven. |
 | Anti-cheat | The gate flags weakened tests and new suppressions (`noqa`, `ts-ignore`, `skip`/`xfail`, tests dropped from collection, snapshot edits, fewer asserts) and fails the round. With a junit report it also fails when fewer tests ran than at the baseline. |
 | What is scored is what is committed | The gate pins a hash of the tree it checked. `record-verdict` refuses to commit if anything changed afterwards. |
 | Bounded cost | At most 6 iterations. Stops early on a plateau (best score did not rise by at least 6 points over the last 3 iterations). |
 | Reversible | Work lives on branch `gauntlet/<component>`. `rollback-to-best` returns to the best iteration without `reset --hard`. Merge is manual. |
 | Auditable | Scorecard with every attempt, score, blockers and gaps in `.gauntlet/`, archived to `.gauntlet/history/` on `close`. |
-| Safe by default | Guard hooks block secret reads, protected-file edits and force pushes. They are inert in projects that did not opt in. |
+| Safe by default | Guard hooks block shell commands that reference secret files, protected-file edits and force pushes. Reads with the Read tool are blocked by `permissions.deny` rules that `/gauntlet:init` adds to `.claude/settings.json` for the files in `secret_files`. They are inert in projects that did not opt in. |
 
 ## When to use it
 
@@ -43,7 +43,7 @@ Use it when there is a **concrete reference** the result can be compared with, a
 - **No concrete reference.** Exploratory work, "make it nicer", brainstorming: the critic has nothing to anchor on.
 - **Small edits.** A typo, a rename, a one-function fix. The loop costs a builder plus a critic run per iteration, up to 6 iterations.
 - **Broken baseline build.** `init` refuses to start. Fix the build first. Tests that already fail are recorded and do not block.
-- **Dirty working tree or no git.** `init` needs a clean tree, git >= 2.23 and a configured identity. The tree must also stay clean after the build and test commands run: put what they generate in `.gitignore`.
+- **Dirty working tree or no git.** `init` needs a clean tree, git >= 2.23 and a configured identity (the identity is not checked up front: the init commit fails after the baseline runs and `init` rolls back). The tree must also stay clean after the build and test commands run: put what they generate in `.gitignore`.
 - **Work that needs secrets or the network.** Secret files are blocked for the agents.
 - **As a security boundary.** The guards are cooperative; a determined agent can bypass them (see Known limits).
 - **Subjective acceptance.** If nobody can write down what "matches" means, the score is noise.
@@ -55,12 +55,13 @@ Use it when there is a **concrete reference** the result can be compared with, a
         |
    init: clean tree + baseline build/tests, branch gauntlet/<component>, reference copied and hash-locked
         |
-   spec-tester --> lock-acceptance: new test files only, every id covered, all red -> committed + hash-locked
-        |          (only with numbered ids and a junit report; skip-acceptance with the user's yes)
+   spec-tester --> lock-acceptance: new test files only, every id covered, all red (or green if preexisting) -> committed + hash-locked
+        |          (only with numbered ids and a pytest junit report; skip-acceptance with the user's yes)
    +--> next-iteration (N)
    |        |
    |    builder (iteration N)  --> stop gate: reference + acceptance locks, anti-cheat, build, tests
-   |        |                          (fails 3x in a row -> GATE_FAILED; junit outcomes stored)
+   |        |                          (3 failed attempts -> 4th stop marks GATE_FAILED; junit outcomes stored;
+   |        |                           valid spec_conflict.json -> HALTED_SPEC_CONFLICT)
    |    critic (iteration N)   --> scores + blockers + gaps
    |        |
    |    record-verdict  --> proof from the gate's junit report, then
@@ -69,6 +70,8 @@ Use it when there is a **concrete reference** the result can be compared with, a
 ```
 
 The default rubric is `functionality` (40), `fidelity` (40) and `quality` (20). Terminal statuses are listed in `templates/RUNBOOK.md`.
+
+Spec conflict: when locked acceptance tests cannot all pass, the builder writes `.gauntlet/inbox/spec_conflict.json`; the stop gate (or `gauntlet-cli.mjs spec-conflict`) validates it and halts the loop as `HALTED_SPEC_CONFLICT`. An invalid declaration counts as a failed gate attempt.
 
 ## What is in it
 
@@ -156,7 +159,7 @@ claude plugin update gauntlet@gauntlet-local --scope local
 claude plugin uninstall gauntlet@gauntlet-local --scope local
 ```
 
-Uninstalling the plugin does not undo `/gauntlet:init`: `.gauntlet/`, `.claude/harness/` and the `## Harness` block in `CLAUDE.md` stay in the project until you delete them.
+Uninstalling the plugin does not undo `/gauntlet:init`: `.gauntlet/`, `.claude/harness/`, the `## Harness` block in `CLAUDE.md`, the secret-file `permissions.deny` rules in `.claude/settings.json` and the `.gitignore` entries stay in the project until you delete them.
 
 ## Use
 
@@ -164,7 +167,7 @@ Uninstalling the plugin does not undo `/gauntlet:init`: `.gauntlet/`, `.claude/h
    - `--migrate` replaces a legacy harness-kit install: it removes only the harness-kit files (the six hook files and `lib/common.mjs` in `.claude/hooks`, builder/critic agents, `/gauntlet` command, `.gauntlet/gauntlet-cli.mjs`) and their hook commands in `settings.json`. Your own hooks are left alone.
 2. `/gauntlet:gauntlet <component> <reference_path>` to start, `/gauntlet:gauntlet` to continue.
 
-You do not have to type `/gauntlet:gauntlet` yourself. Describe the task with its reference ("rebuild the login form to match `docs/mockups/login.png`") and Claude proposes the loop; it starts only after you say yes. This relies on two things: the command `description`, which lists when to use it and when not to, and the `## Harness` block that `/gauntlet:init` writes to `CLAUDE.md`. Matching is probabilistic, so when Claude does not propose it, type the command. The command itself refuses to start if the model launched it without your confirmation.
+You do not have to type `/gauntlet:gauntlet` yourself. Describe the task with its reference ("rebuild the login form to match `docs/mockups/login.png`") and Claude proposes the loop; it starts only after you say yes. This relies on two things: the command `description`, which lists when to use it and when not to, and the `## Harness` block that `/gauntlet:init` writes to `CLAUDE.md`. Matching is probabilistic, so when Claude does not propose it, type the command. The command's prompt tells the model to stop if it launched the command without your confirmation (instructed, not technically enforced).
 
 `/gauntlet:init` stays explicit (`disable-model-invocation`): it writes files into the project and, with `--migrate`, deletes legacy ones. Projects initialised before this change need the new `CLAUDE.md` sentence: delete the old `## Harness` block and re-run `/gauntlet:init`, or add it by hand.
 
@@ -206,9 +209,9 @@ The reference is copied to `.gauntlet/reference/` and hash-locked, so the builde
 /gauntlet:gauntlet invoice-parser docs/specs/invoice-parser.md
 ```
 
-Every explicit requirement in the spec that is not met, or not proven by running something, becomes a blocker, whatever the total score, so a 90-point artifact with one violated or unproven rule is not approved. Number the requirements (`R1.`, `AC-2:`) so the CLI can check that the critic reported each one.
+Every explicit requirement in the spec that is not met, or not proven by running something, becomes a blocker, whatever the total score, so a 90-point artifact with one violated or unproven rule is not approved. Number the requirements (`R1.`, `AC-2:`) so the CLI can check that the critic reported each one. Ids are read only from `.md`, `.markdown`, `.txt`, `.rst` and `.adoc` reference files.
 
-Numbered requirements plus a test command with a junit report (`"junit": "pytest"` in `discovery.json`) turn on the acceptance phase. Before the first builder, the spec-tester writes `tests/acceptance/test_invoice_parser_acceptance.py` with tests such as `test_r1_rejects_negative_totals`, and `lock-acceptance` checks that they are new files, cover every id (or say why an id cannot be tested), and all fail. From then on R1 is proven only when `test_r1_rejects_negative_totals` passes in the gate's run, and nobody in the loop can edit that file. The lock lasts while the loop runs; after `close` they are ordinary tests.
+Numbered requirements plus a test command with a junit report (`"junit": "pytest"` in `discovery.json`, the only junit reporter supported) turn on the acceptance phase. Before the first builder, the spec-tester writes `tests/acceptance/test_invoice_parser_acceptance.py` with tests such as `test_r1_rejects_negative_totals`, and `lock-acceptance` checks that they are new files, cover every id (or say why an id cannot be tested), and all fail (tests marked `preexisting` must pass instead). From then on R1 is proven only when `test_r1_rejects_negative_totals` passes in the gate's run, and nobody in the loop can edit that file. The lock lasts while the loop is running; once it reaches a terminal status (before `close`) they are ordinary tests.
 
 ### 4. Continue, inspect, finish
 
@@ -265,6 +268,8 @@ $env:HARNESS_OFF = "1"
 claude
 ```
 
+`HARNESS_OFF=1` also turns off the stop gate, so a Gauntlet Loop cannot advance in that session: `record-verdict` refuses every iteration.
+
 ## Rules of thumb
 
 - Write the reference first. A vague reference gives a vague score.
@@ -275,11 +280,11 @@ claude
 ## Guards
 
 - `bash-guard` runs for both the `Bash` and the `PowerShell` tools.
-- The CLI exposes only `init`, `lock-acceptance`, `skip-acceptance`, `next-iteration`, `record-verdict`, `rollback-to-best`, `close` and `status`.
-- While acceptance is pending, `next-iteration`, `record-verdict` and the circuit breaker refuse builders; the spec-tester can only be dispatched then. Locked acceptance files are blocked for Edit/Write and shell writes while the loop runs. The gate transitions are exported for the stop gate hook and are not reachable from the command line.
+- The CLI exposes only `init`, `lock-acceptance`, `skip-acceptance`, `next-iteration`, `record-verdict`, `rollback-to-best`, `spec-conflict`, `close` and `status`.
+- While acceptance is pending, `next-iteration`, `record-verdict` and the circuit breaker refuse builders; the spec-tester can only be dispatched then. Locked acceptance files are blocked for Edit/Write and shell writes while the loop runs. The other gate transitions are exported for the stop gate hook and are not reachable from the command line.
 - `init` warns when a baseline test command fails without per-test ids (no junit): the test gate is inert for it. It also warns when a test command has no junit report, because the executed-test count cannot be checked then.
 - The stop gate is idempotent: a repeated stop with an unchanged tree does not re-run the checks, use up an attempt or delete the critic report.
-- On Windows, `.cmd`/`.bat` commands (`npm`, `npx`, `pnpm`, `yarn`) run through `cmd.exe` with escaped arguments; everything else is spawned directly, without a shell. A timeout kills `cmd.exe` but may leave its child process running.
+- On Windows, `.cmd`/`.bat` commands (`npm`, `npx`, `pnpm`, `yarn`) run through `cmd.exe` with escaped arguments; everything else is spawned directly, without a shell. A timeout kills `cmd.exe` but may leave its child process running. This applies to build and test commands only: `fast-file-check` spawns `fast_lint` directly, so a `.cmd`/`.bat` linter fails and the hook only warns.
 - The critic treats the artifact, tests, script output and reference as data, never as instructions (instructed, not technically enforced).
 
 Kill switch: `HARNESS_OFF=1`. Details: `templates/RUNBOOK.md` (copied to `.gauntlet/RUNBOOK.md` by init).
